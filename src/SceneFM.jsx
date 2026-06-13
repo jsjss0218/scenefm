@@ -59,6 +59,7 @@ const enc = (s) => encodeURIComponent(s);
 const ytmusic = (t, a) => `https://music.youtube.com/search?q=${enc(`${t} ${a}`)}`;
 const spotifySearch = (t, a) => `https://open.spotify.com/search/${enc(`${t} ${a}`)}`;
 const ENABLE_SPOTIFY_SEARCH_API = false; // 429 방지: 기본값은 Spotify Search API 호출 금지
+const DEFAULT_SPOTIFY_PLAYLIST_ID = "6A29XKZg8p3RPVFn2UXHnq";
 // Fisher–Yates 셔플 (원본 배열 보존)
 function shuffleArr(arr) {
   const a = arr.slice();
@@ -383,6 +384,14 @@ function trackSpotifyUri(track) {
   const url = track?.spotify_url || track?.spotifyUrl || track?.spotify?.url;
   const m = typeof url === "string" ? url.match(/open\.spotify\.com\/track\/([A-Za-z0-9]{22})/) : null;
   return m ? `spotify:track:${m[1]}` : null;
+}
+function spotifyPlaylistIdFromUrl(url) {
+  const m = typeof url === "string" ? url.match(/open\.spotify\.com\/playlist\/([A-Za-z0-9]{22})/) : null;
+  return m ? m[1] : null;
+}
+function spotifyPlaylistEmbedUrl(idOrUrl) {
+  const id = spotifyPlaylistIdFromUrl(idOrUrl) || idOrUrl || DEFAULT_SPOTIFY_PLAYLIST_ID;
+  return `https://open.spotify.com/embed/playlist/${enc(id)}?utm_source=generator&theme=0`;
 }
 function scoreSpotifyTrack(item, title, artist) {
   const wantedTitle = normSearchText(title);
@@ -1099,6 +1108,7 @@ function TrackRow({ t, accent, idx, current, playing, last }) {
 // ── Station (result) — album-page feel ──
 function StationView({ result, shot, accent, accent2, onMood, busyMood, onRestart, error, spotify, onSaveSpotify, shuffle, onShuffle, onPlayTrack, onOpenSpotify, player, onPlayInApp, onTogglePlay, onNext, onPrev, onSeek }) {
   const [open, setOpen] = useState(false);
+  const [showEmbed, setShowEmbed] = useState(false);
   const tracks = Array.isArray(result.tracks) ? result.tracks : [];
   const grouped = [1, 2, 3, 4, 5].map((s) => ({ s, items: tracks.filter((t) => Number(t.s) === s) })).filter((g) => g.items.length);
   const sceneOrder = [["place", "장소"], ["time", "시간대"], ["color", "색감"], ["motion", "움직임"], ["weather", "날씨"], ["emotion", "감정"], ["era", "시대감"]];
@@ -1122,6 +1132,7 @@ function StationView({ result, shot, accent, accent2, onMood, busyMood, onRestar
   const saveDone = spotify.status === "done";
   const saveWorking = spotify.status === "connecting" || spotify.status === "working";
   const canSaveSpotify = tracks.some(trackSpotifyUri);
+  const embedUrl = spotifyPlaylistEmbedUrl(spotify.url || DEFAULT_SPOTIFY_PLAYLIST_ID);
 
   // 메인 CTA 라벨: 상태별로 명확히 구분
   const playLabel = working ? "준비 중…" : err ? "다시 재생" : playing ? "일시정지" : ready ? "재생" : "지금 이 플레이리스트 재생하기";
@@ -1156,14 +1167,29 @@ function StationView({ result, shot, accent, accent2, onMood, busyMood, onRestar
             {meta && <div className="sfm-lat" style={{ marginTop: 10, fontSize: 12.5, fontWeight: 600, letterSpacing: ".06em", color: accent }}>{meta}</div>}
           </div>
 
-          {/* action row: 셔플 토글 · Spotify 열기 CTA · 저장 */}
+          {/* action row: 셔플 토글 · 인앱 재생 CTA · 저장 */}
           <div style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: 14, margin: "20px 0 10px" }}>
             <RoundBtn onClick={onShuffle} label="랜덤 재생" active={shuffle} accent={accent}><ShuffleIcon /></RoundBtn>
-            <button onClick={onOpenSpotify} style={{ flex: 1, maxWidth: 300, minHeight: 58, padding: "0 14px", display: "flex", alignItems: "center", justifyContent: "center", gap: 10, borderRadius: 999, border: "none", background: STU.ink, color: "#fff", cursor: "pointer", fontWeight: 800, fontSize: 16, lineHeight: 1.15 }}>
-              <SpotifyIcon size={20} color="#fff" /> Spotify에서 재생하기
+            <button onClick={() => setShowEmbed((v) => !v)} style={{ flex: 1, maxWidth: 300, minHeight: 58, padding: "0 14px", display: "flex", alignItems: "center", justifyContent: "center", gap: 10, borderRadius: 999, border: "none", background: STU.ink, color: "#fff", cursor: "pointer", fontWeight: 800, fontSize: 16, lineHeight: 1.15 }}>
+              <SpotifyIcon size={20} color="#fff" /> {showEmbed ? "플레이어 접기" : "앱 안에서 재생하기"}
             </button>
             <RoundBtn onClick={onSaveSpotify} label={canSaveSpotify ? "Spotify에 저장" : "Spotify URI가 없어 자동 저장할 수 없어요"} disabled={!canSaveSpotify || saveWorking}>{saveDone ? <CheckIcon /> : <PlusIcon />}</RoundBtn>
           </div>
+
+          {showEmbed && (
+            <div className="sfm-rise" style={{ margin: "12px 0 8px", borderRadius: 12, overflow: "hidden", border: `1px solid ${STU.line}`, background: "#121212", boxShadow: "0 12px 28px rgba(0,0,0,.12)" }}>
+              <iframe
+                title="Scene FM Spotify Player"
+                src={embedUrl}
+                width="100%"
+                height="380"
+                style={{ display: "block", minHeight: 360, border: 0 }}
+                frameBorder="0"
+                allow="autoplay; clipboard-write; encrypted-media; fullscreen; picture-in-picture"
+                loading="lazy"
+              />
+            </div>
+          )}
 
           {/* 랜덤 재생 상태 표시 */}
           {shuffle && (
@@ -1172,9 +1198,9 @@ function StationView({ result, shot, accent, accent2, onMood, busyMood, onRestar
             </div>
           )}
 
-          {/* 보조 트리거: Spotify에서 열기 · 다시 만들기 */}
+          {/* 보조 트리거: 외부에서 열기 · 다시 만들기 */}
           <div style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: 8, marginBottom: 4 }}>
-            <button onClick={onOpenSpotify} style={{ display: "inline-flex", alignItems: "center", gap: 6, padding: "8px 14px", borderRadius: 999, border: `1px solid ${STU.line}`, background: STU.bg, color: STU.ink, cursor: "pointer", fontWeight: 700, fontSize: 13 }}><SpotifyIcon size={15} color="#1DB954" /> Spotify에서 열기</button>
+            <button onClick={onOpenSpotify} style={{ display: "inline-flex", alignItems: "center", gap: 6, padding: "8px 14px", borderRadius: 999, border: `1px solid ${STU.line}`, background: STU.bg, color: STU.ink, cursor: "pointer", fontWeight: 700, fontSize: 13 }}><SpotifyIcon size={15} color="#1DB954" /> Spotify 외부 열기</button>
             <button onClick={onRestart} style={{ display: "inline-flex", alignItems: "center", gap: 6, padding: "8px 14px", borderRadius: 999, border: `1px solid ${STU.line}`, background: STU.bg, color: STU.ink, cursor: "pointer", fontWeight: 700, fontSize: 13 }}><RefreshIcon /> 다시 만들기</button>
           </div>
 
