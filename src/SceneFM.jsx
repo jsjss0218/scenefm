@@ -263,7 +263,7 @@ function loadSpotifySdk() {
 async function searchTrackUri(token, t, a) {
   const tryQ = async (q) => {
     try {
-      const d = await spGet(token, "/search?type=track&limit=5&market=from_token&q=" + enc(q));
+      const d = await spGet(token, "/search?type=track&limit=5&q=" + enc(q));
       const item = d.tracks && d.tracks.items && d.tracks.items[0];
       return item && typeof item.uri === "string" && item.uri.startsWith("spotify:track:") ? item.uri : null;
     } catch { return null; }
