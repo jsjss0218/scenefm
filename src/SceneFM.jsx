@@ -252,6 +252,7 @@ function requireSpotifyScopes(scope, required, purpose) {
     `${purpose} 권한이 부족해요. spotify.com/account/apps 에서 'Scene FM' 접근을 제거(REVOKE)한 뒤 다시 로그인하세요. (부족한 권한: ${missing.join(", ")})`
   );
 }
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 // 실패 응답의 본문까지 읽어 실제 원인(403/401/400…)을 메시지에 담는다
 async function spErr(res, path) {
   let detail = "";
@@ -261,25 +262,38 @@ async function spErr(res, path) {
     res.status === 403 ? " — 개발 모드 앱이면 Dashboard → User Management에 이 Spotify 계정이 추가됐는지 확인하세요. (재생은 Premium 필요)"
     : res.status === 401 ? " — 토큰이 만료됐어요. 다시 로그인해 주세요."
     : res.status === 404 ? " — 활성 디바이스를 찾지 못했어요."
+    : res.status === 429 ? " — Spotify 요청이 너무 많아요. 잠시 후 자동 재시도하거나 1분 뒤 다시 눌러주세요."
     : "";
   return `Spotify ${res.status}${detail ? `: ${detail}` : ` (${path})`}${hint}`;
 }
+async function spFetch(token, path, options = {}, attempt = 0) {
+  const res = await fetch("https://api.spotify.com/v1" + path, {
+    ...options,
+    headers: { Authorization: "Bearer " + token, ...(options.headers || {}) },
+  });
+  if (res.status === 429 && attempt < 3) {
+    const retryAfter = Number(res.headers.get("Retry-After") || 1);
+    await sleep(Math.min(8000, Math.max(1000, retryAfter * 1000)) + attempt * 500);
+    return spFetch(token, path, options, attempt + 1);
+  }
+  return res;
+}
 async function spGet(token, path) {
-  const res = await fetch("https://api.spotify.com/v1" + path, { headers: { Authorization: "Bearer " + token } });
+  const res = await spFetch(token, path);
   if (!res.ok) throw new Error(await spErr(res, path));
   return res.json();
 }
 async function spPost(token, path, body) {
-  const res = await fetch("https://api.spotify.com/v1" + path, {
-    method: "POST", headers: { Authorization: "Bearer " + token, "Content-Type": "application/json" },
+  const res = await spFetch(token, path, {
+    method: "POST", headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
   });
   if (!res.ok) throw new Error(await spErr(res, path));
   return res.json();
 }
 async function spPut(token, path, body) {
-  const res = await fetch("https://api.spotify.com/v1" + path, {
-    method: "PUT", headers: { Authorization: "Bearer " + token, "Content-Type": "application/json" },
+  const res = await spFetch(token, path, {
+    method: "PUT", headers: { "Content-Type": "application/json" },
     body: body ? JSON.stringify(body) : undefined,
   });
   if (!res.ok && res.status !== 204) throw new Error(await spErr(res, path));
@@ -359,9 +373,11 @@ async function spotifyTrackSearch(token, q, limit = 10) {
   const d = await spGet(token, "/search?" + params.toString());
   return d.tracks?.items || [];
 }
-async function searchTrackUri(token, t, a) {
+async function searchTrackUri(token, t, a, cache) {
   const title = cleanTrackText(t);
   const artist = primaryArtist(a);
+  const cacheKey = `${normSearchText(title)}::${normSearchText(artist)}`;
+  if (cache?.has(cacheKey)) return cache.get(cacheKey);
   const candidates = [
     title && artist ? `track:${title} artist:${artist}` : "",
     title && artist ? `${title} ${artist}` : "",
@@ -376,9 +392,10 @@ async function searchTrackUri(token, t, a) {
       .filter((item) => typeof item.uri === "string" && item.uri.startsWith("spotify:track:"))
       .map((item) => ({ item, score: scoreSpotifyTrack(item, title, artist) }))
       .sort((x, y) => y.score - x.score);
-    if (ranked[0]?.score > 0) return ranked[0].item.uri;
-    if (ranked[0]?.item?.uri) return ranked[0].item.uri;
+    if (ranked[0]?.score > 0) { cache?.set(cacheKey, ranked[0].item.uri); return ranked[0].item.uri; }
+    if (ranked[0]?.item?.uri) { cache?.set(cacheKey, ranked[0].item.uri); return ranked[0].item.uri; }
   }
+  cache?.set(cacheKey, null);
   return null;
 }
 
@@ -493,8 +510,10 @@ export default function SceneFM() {
 
   const resolveQueueUris = useCallback(async (access, tracks, onProgress) => {
     const seen = new Set(); const uris = []; let done = 0;
+    const searchCache = new Map();
     for (const t of tracks) {
-      const uri = await searchTrackUri(access, t.t, t.a);
+      if (done > 0) await sleep(180);
+      const uri = await searchTrackUri(access, t.t, t.a, searchCache);
       if (uri && !seen.has(uri)) { seen.add(uri); uris.push(uri); }
       done++;
       onProgress && onProgress(done, uris.length);
@@ -612,7 +631,7 @@ export default function SceneFM() {
       if (!uris.length) throw new Error("추천된 곡명을 Spotify 검색으로 찾지 못했어요. 곡명/아티스트 표기를 바꿔 다시 분석해 보세요.");
       if (doShuffle) uris = shuffleArr(uris);
       if (startTrack) {
-        const u = await searchTrackUri(access, startTrack.t, startTrack.a);
+        const u = await searchTrackUri(access, startTrack.t, startTrack.a, new Map());
         if (u) uris = [u, ...uris.filter((x) => x !== u)];
       }
       urisRef.current = uris;
