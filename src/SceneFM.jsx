@@ -223,7 +223,8 @@ async function spotifyAuthorize() {
     }),
   });
   if (!res.ok) throw new Error("Spotify 토큰 발급에 실패했어요.");
-  return (await res.json()).access_token;
+  const json = await res.json();
+  return { access: json.access_token, scope: json.scope || "" };
 }
 // 실패 응답의 본문까지 읽어 실제 원인(403/401/400…)을 메시지에 담는다
 async function spErr(res, path) {
@@ -372,8 +373,15 @@ export default function SceneFM() {
 
   const ensureSpotify = useCallback(async () => {
     if (!tokenRef.current.access) {
-      const access = await spotifyAuthorize();
+      const { access, scope } = await spotifyAuthorize();
+      // 오래된 동의가 남아 쓰기 권한이 빠진 토큰이 발급되는 경우를 즉시 감지
+      if (!/playlist-modify-(private|public)/.test(scope)) {
+        throw new Error(
+          "이 로그인에는 플레이리스트 생성 권한이 없습니다. spotify.com/account/apps 에서 'Scene FM' 접근을 제거(REVOKE)한 뒤 다시 로그인하세요. (부여된 권한: " + (scope || "없음") + ")"
+        );
+      }
       tokenRef.current.access = access;
+      tokenRef.current.scope = scope;
       tokenRef.current.userId = (await spGet(access, "/me")).id;
     }
     return tokenRef.current;
