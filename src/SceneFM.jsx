@@ -328,15 +328,58 @@ function loadSpotifySdk() {
   });
   return sdkPromise;
 }
+function cleanTrackText(s) {
+  return String(s || "")
+    .replace(/\s*[-–—]\s*(remaster(ed)?|live|mono|stereo|radio edit|single version).*$/i, "")
+    .replace(/\s*\((feat\.?|with|remaster(ed)?|live|mono|stereo|radio edit|single version)[^)]+\)/gi, "")
+    .replace(/\s*\[[^\]]+\]/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+function primaryArtist(s) {
+  return cleanTrackText(String(s || "").split(/\s*(?:,|&|\+| x | X | feat\.?| featuring | with )\s*/i)[0]);
+}
+function normSearchText(s) {
+  return cleanTrackText(s).toLowerCase().replace(/[\s'"’‘“”.,:;!?()[\]{}\-–—_/\\]+/g, "");
+}
+function scoreSpotifyTrack(item, title, artist) {
+  const wantedTitle = normSearchText(title);
+  const wantedArtist = normSearchText(artist);
+  const itemTitle = normSearchText(item?.name);
+  const itemArtists = normSearchText((item?.artists || []).map((x) => x.name).join(" "));
+  let score = 0;
+  if (itemTitle === wantedTitle) score += 6;
+  else if (itemTitle.includes(wantedTitle) || wantedTitle.includes(itemTitle)) score += 3;
+  if (wantedArtist && itemArtists.includes(wantedArtist)) score += 4;
+  if (item?.uri?.startsWith("spotify:track:")) score += 1;
+  return score;
+}
+async function spotifyTrackSearch(token, q, limit = 10) {
+  const params = new URLSearchParams({ type: "track", limit: String(limit), q });
+  const d = await spGet(token, "/search?" + params.toString());
+  return d.tracks?.items || [];
+}
 async function searchTrackUri(token, t, a) {
-  const tryQ = async (q) => {
-    try {
-      const d = await spGet(token, "/search?type=track&limit=5&q=" + enc(q));
-      const item = d.tracks && d.tracks.items && d.tracks.items[0];
-      return item && typeof item.uri === "string" && item.uri.startsWith("spotify:track:") ? item.uri : null;
-    } catch { return null; }
-  };
-  return (await tryQ(`track:${t} artist:${a}`)) || (await tryQ(`${t} ${a}`));
+  const title = cleanTrackText(t);
+  const artist = primaryArtist(a);
+  const candidates = [
+    title && artist ? `track:${title} artist:${artist}` : "",
+    title && artist ? `${title} ${artist}` : "",
+    title || "",
+  ].filter(Boolean);
+  const seenQueries = new Set();
+  for (const q of candidates) {
+    if (seenQueries.has(q)) continue;
+    seenQueries.add(q);
+    const items = await spotifyTrackSearch(token, q);
+    const ranked = items
+      .filter((item) => typeof item.uri === "string" && item.uri.startsWith("spotify:track:"))
+      .map((item) => ({ item, score: scoreSpotifyTrack(item, title, artist) }))
+      .sort((x, y) => y.score - x.score);
+    if (ranked[0]?.score > 0) return ranked[0].item.uri;
+    if (ranked[0]?.item?.uri) return ranked[0].item.uri;
+  }
+  return null;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -468,7 +511,7 @@ export default function SceneFM() {
       setSpotify((s) => ({ ...s, status: "working", progress: "곡을 찾는 중…" }));
       const uris = await resolveQueueUris(access, tracks, (done, matched) =>
         setSpotify((s) => ({ ...s, progress: `곡을 찾는 중 ${done}/${tracks.length}`, matched })));
-      if (!uris.length) throw new Error("이 장면의 곡들이 Spotify에 없어 플레이리스트를 만들지 못했어요.");
+      if (!uris.length) throw new Error("추천된 곡명을 Spotify 검색으로 찾지 못했어요. 곡명/아티스트 표기를 바꿔 다시 분석해 보세요.");
       setSpotify((s) => ({ ...s, progress: `${uris.length}곡으로 플레이리스트 만드는 중…` }));
       const desc = (result.tagline ? result.tagline + " · " : "") + "Made by Scene FM";
       const pl = await spPost(access, `/users/${userId}/playlists`, {
@@ -566,7 +609,7 @@ export default function SceneFM() {
 
       setPlayer((p) => ({ ...p, status: "resolving" }));
       let uris = await resolveQueueUris(access, tracks);
-      if (!uris.length) throw new Error("이 장면의 곡들이 Spotify에 없어 재생할 수 없어요.");
+      if (!uris.length) throw new Error("추천된 곡명을 Spotify 검색으로 찾지 못했어요. 곡명/아티스트 표기를 바꿔 다시 분석해 보세요.");
       if (doShuffle) uris = shuffleArr(uris);
       if (startTrack) {
         const u = await searchTrackUri(access, startTrack.t, startTrack.a);
