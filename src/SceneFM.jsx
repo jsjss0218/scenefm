@@ -659,9 +659,7 @@ export default function SceneFM() {
       setPlayer((p) => ({ ...p, status: "resolving" }));
       let uris = await resolveQueueUris(null, playbackTracks, null, 1);
       if (!uris.length) {
-        const firstTrack = playbackTracks[0];
-        if (firstTrack) window.open(spotifySearch(firstTrack.t, firstTrack.a), "_blank", "noopener");
-        throw new Error("429 방지를 위해 Spotify 검색 API를 끈 상태예요. Spotify 검색 페이지를 열었어요.");
+        throw new Error("429 방지를 위해 Spotify 검색 API를 끈 상태예요. 자동 검색 화면은 열지 않습니다.");
       }
       const { access } = await ensureSpotify();
       const sdkPlayer = await ensureSdkPlayer();
