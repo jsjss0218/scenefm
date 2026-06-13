@@ -253,6 +253,16 @@ function requireSpotifyScopes(scope, required, purpose) {
   );
 }
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+function assertSpotifyPlaybackEnvironment() {
+  const host = window.location.hostname;
+  const isLocal = host === "localhost" || host === "127.0.0.1" || host === "::1";
+  if (!window.isSecureContext && !isLocal) {
+    throw new Error("Spotify 앱 내 재생은 HTTPS 또는 localhost에서만 안정적으로 동작해요.");
+  }
+  if (!window.MediaSource && !window.ManagedMediaSource) {
+    throw new Error("이 브라우저는 Spotify Web Playback을 지원하지 않을 수 있어요. Chrome/Edge 데스크톱에서 다시 시도해 주세요.");
+  }
+}
 // 실패 응답의 본문까지 읽어 실제 원인(403/401/400…)을 메시지에 담는다
 async function spErr(res, path) {
   let detail = "";
@@ -508,7 +518,7 @@ export default function SceneFM() {
     return tokenRef.current;
   }, []);
 
-  const resolveQueueUris = useCallback(async (access, tracks, onProgress) => {
+  const resolveQueueUris = useCallback(async (access, tracks, onProgress, maxMatches = Infinity) => {
     const seen = new Set(); const uris = []; let done = 0;
     const searchCache = new Map();
     for (const t of tracks) {
@@ -517,6 +527,7 @@ export default function SceneFM() {
       if (uri && !seen.has(uri)) { seen.add(uri); uris.push(uri); }
       done++;
       onProgress && onProgress(done, uris.length);
+      if (uris.length >= maxMatches) break;
     }
     return uris;
   }, []);
@@ -624,10 +635,13 @@ export default function SceneFM() {
     playLockRef.current = true;
     try {
       setPlayer((p) => ({ ...p, status: "connecting", error: "", premiumRequired: false }));
+      assertSpotifyPlaybackEnvironment();
       const { access } = await ensureSpotify();
+      const sdkPlayer = await ensureSdkPlayer();
+      try { sdkPlayer.activateElement && sdkPlayer.activateElement(); } catch {}
 
       setPlayer((p) => ({ ...p, status: "resolving" }));
-      let uris = await resolveQueueUris(access, tracks);
+      let uris = await resolveQueueUris(access, tracks, null, 8);
       if (!uris.length) throw new Error("추천된 곡명을 Spotify 검색으로 찾지 못했어요. 곡명/아티스트 표기를 바꿔 다시 분석해 보세요.");
       if (doShuffle) uris = shuffleArr(uris);
       if (startTrack) {
@@ -636,7 +650,6 @@ export default function SceneFM() {
       }
       urisRef.current = uris;
 
-      const sdkPlayer = await ensureSdkPlayer();
       setPlayer((p) => ({ ...p, status: "ready", uris, index: 0 }));
       try { sdkPlayer.activateElement && sdkPlayer.activateElement(); } catch {}
       // 디바이스가 Spotify 백엔드에 완전히 등록될 시간을 약간 준 뒤,
@@ -645,7 +658,8 @@ export default function SceneFM() {
       await transferPlayback(access, deviceIdRef.current);
       await startPlayback(access, deviceIdRef.current, uris);
     } catch (e) {
-      setPlayer((p) => ({ ...p, status: "error", error: e.message || "재생을 시작하지 못했어요." }));
+      const msg = e.message || "재생을 시작하지 못했어요.";
+      setPlayer((p) => ({ ...p, status: "error", error: msg, premiumRequired: /premium|403|account/i.test(msg) }));
     } finally {
       playLockRef.current = false;
     }
