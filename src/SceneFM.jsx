@@ -10,7 +10,15 @@ import React, { useEffect, useRef, useState, useCallback } from "react";
 const SPOTIFY_CLIENT_ID = "e51bc8c11879482a80216d21f42565cd"; // developer.spotify.com 에서 발급
 const SPOTIFY_REDIRECT_URI =
   typeof window !== "undefined" ? window.location.origin + window.location.pathname : "";
-const SPOTIFY_SCOPES = "playlist-modify-private playlist-modify-public streaming user-read-email user-read-private";
+const SPOTIFY_SCOPES = [
+  "playlist-modify-private",
+  "playlist-modify-public",
+  "streaming",
+  "user-read-email",
+  "user-read-private",
+  "user-read-playback-state",
+  "user-modify-playback-state",
+].join(" ");
 // ▲▲▲ 이 앱이 등록된 Redirect URI 와 SPOTIFY_REDIRECT_URI 가 정확히 일치해야 합니다 ▲▲▲
 
 const FONT_CSS = `
@@ -236,6 +244,14 @@ async function spotifyAuthorize() {
   const json = await res.json();
   return { access: json.access_token, scope: json.scope || "" };
 }
+function requireSpotifyScopes(scope, required, purpose) {
+  const granted = new Set(String(scope || "").split(/\s+/).filter(Boolean));
+  const missing = required.filter((s) => !granted.has(s));
+  if (!missing.length) return;
+  throw new Error(
+    `${purpose} 권한이 부족해요. spotify.com/account/apps 에서 'Scene FM' 접근을 제거(REVOKE)한 뒤 다시 로그인하세요. (부족한 권한: ${missing.join(", ")})`
+  );
+}
 // 실패 응답의 본문까지 읽어 실제 원인(403/401/400…)을 메시지에 담는다
 async function spErr(res, path) {
   let detail = "";
@@ -269,13 +285,26 @@ async function spPut(token, path, body) {
   if (!res.ok && res.status !== 204) throw new Error(await spErr(res, path));
   return res.status === 204 ? null : res.json().catch(() => null);
 }
+async function transferPlayback(token, deviceId, attempt = 0) {
+  if (!deviceId) throw new Error("재생할 디바이스를 찾지 못했어요. 다시 시도해 주세요.");
+  try {
+    await spPut(token, "/me/player", { device_ids: [deviceId], play: false });
+  } catch (e) {
+    const retriable = /\b(404|500|502|503|504)\b/.test(e.message);
+    if (attempt < 5 && retriable) {
+      await new Promise((r) => setTimeout(r, 500 + attempt * 450));
+      return transferPlayback(token, deviceId, attempt + 1);
+    }
+    throw e;
+  }
+}
 // 지정한 디바이스에서 '이 큐(uris)만' 재생. 디바이스가 아직 미등록(404)이거나
 // 일시적 서버 오류(5xx)면 점증 지연으로 재시도해 간헐적 재생 실패를 줄인다.
 async function startPlayback(token, deviceId, uris, attempt = 0) {
   if (!deviceId) throw new Error("재생할 디바이스를 찾지 못했어요. 다시 시도해 주세요.");
   if (!uris || !uris.length) throw new Error("재생할 곡을 찾지 못했어요.");
   try {
-    await spPut(token, `/me/player/play?device_id=${deviceId}`, { uris });
+    await spPut(token, `/me/player/play?device_id=${encodeURIComponent(deviceId)}`, { uris });
   } catch (e) {
     const retriable = /\b(404|500|502|503|504)\b/.test(e.message);
     if (attempt < 5 && retriable) {
@@ -401,16 +430,21 @@ export default function SceneFM() {
   const ensureSpotify = useCallback(async () => {
     if (!tokenRef.current.access) {
       const { access, scope } = await spotifyAuthorize();
-      // 오래된 동의가 남아 쓰기 권한이 빠진 토큰이 발급되는 경우를 즉시 감지
-      if (!/playlist-modify-(private|public)/.test(scope)) {
-        throw new Error(
-          "이 로그인에는 플레이리스트 생성 권한이 없습니다. spotify.com/account/apps 에서 'Scene FM' 접근을 제거(REVOKE)한 뒤 다시 로그인하세요. (부여된 권한: " + (scope || "없음") + ")"
-        );
-      }
+      // 오래된 동의가 남아 필요한 권한이 빠진 토큰이 발급되는 경우를 즉시 감지
+      requireSpotifyScopes(
+        scope,
+        ["playlist-modify-private", "streaming", "user-read-playback-state", "user-modify-playback-state"],
+        "Spotify 저장/재생"
+      );
       tokenRef.current.access = access;
       tokenRef.current.scope = scope;
       tokenRef.current.userId = (await spGet(access, "/me")).id;
     }
+    requireSpotifyScopes(
+      tokenRef.current.scope,
+      ["playlist-modify-private", "streaming", "user-read-playback-state", "user-modify-playback-state"],
+      "Spotify 저장/재생"
+    );
     return tokenRef.current;
   }, []);
 
@@ -543,9 +577,11 @@ export default function SceneFM() {
       const sdkPlayer = await ensureSdkPlayer();
       setPlayer((p) => ({ ...p, status: "ready", uris, index: 0 }));
       try { sdkPlayer.activateElement && sdkPlayer.activateElement(); } catch {}
-      // 디바이스가 Spotify 백엔드에 완전히 등록될 시간을 약간 준다
+      // 디바이스가 Spotify 백엔드에 완전히 등록될 시간을 약간 준 뒤,
+      // 계정의 현재 재생 디바이스를 SDK 플레이어로 명시 전환한다.
       await new Promise((r) => setTimeout(r, 350));
-      await startPlayback(tokenRef.current.access, deviceIdRef.current, uris);
+      await transferPlayback(access, deviceIdRef.current);
+      await startPlayback(access, deviceIdRef.current, uris);
     } catch (e) {
       setPlayer((p) => ({ ...p, status: "error", error: e.message || "재생을 시작하지 못했어요." }));
     } finally {
@@ -1137,4 +1173,3 @@ function MoreIcon() { return <svg width="20" height="20" viewBox="0 0 24 24" fil
 function ChevronLeft() { return <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round"><path d="M15 18l-6-6 6-6" /></svg>; }
 function ShareIcon() { return <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"><path d="M12 16V4M8 8l4-4 4 4" /><path d="M5 12v7a1 1 0 001 1h12a1 1 0 001-1v-7" /></svg>; }
 function SpotifyIcon({ size = 18, color = "#1DB954" }) { return <svg width={size} height={size} viewBox="0 0 24 24" fill={color}><path d="M12 2a10 10 0 100 20 10 10 0 000-20zm4.6 14.4a.62.62 0 01-.86.21c-2.35-1.44-5.3-1.76-8.79-.96a.62.62 0 11-.28-1.21c3.81-.87 7.08-.5 9.72 1.11.3.18.39.57.21.85zm1.23-2.73a.78.78 0 01-1.07.26c-2.69-1.65-6.79-2.13-9.97-1.17a.78.78 0 11-.45-1.49c3.63-1.1 8.15-.56 11.24 1.33.36.22.48.7.25 1.07zm.1-2.85C14.84 8.95 9.6 8.78 6.6 9.69a.93.93 0 11-.54-1.78c3.45-1.05 9.23-.85 12.87 1.31a.93.93 0 11-.95 1.6z" /></svg>; }
-
