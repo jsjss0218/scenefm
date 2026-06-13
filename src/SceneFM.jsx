@@ -558,7 +558,7 @@ export default function SceneFM() {
       setSpotify({ status: "working", progress: "Spotify URI 확인 중…", url: "", matched: 0, total: tracks.length, error: "" });
       const uris = await resolveQueueUris(null, tracks, (done, matched) =>
         setSpotify((s) => ({ ...s, progress: `Spotify URI 확인 중 ${done}/${tracks.length}`, matched })));
-      if (!uris.length) throw new Error("429 방지를 위해 Spotify 검색 API를 끈 상태예요. 추천 결과에 spotify:track URI가 있을 때만 플레이리스트를 만들 수 있어요.");
+      if (!uris.length) throw new Error("추천곡에 Spotify URI가 없어 자동 저장할 수 없어요. 지금은 Spotify에서 직접 열어 주세요.");
       setSpotify((s) => ({ ...s, status: "connecting", progress: "Spotify 연결 중…" }));
       const { access, userId } = await ensureSpotify();
       setSpotify((s) => ({ ...s, progress: `${uris.length}곡으로 플레이리스트 만드는 중…` }));
@@ -659,7 +659,7 @@ export default function SceneFM() {
       setPlayer((p) => ({ ...p, status: "resolving" }));
       let uris = await resolveQueueUris(null, playbackTracks, null, 1);
       if (!uris.length) {
-        throw new Error("429 방지를 위해 Spotify 검색 API를 끈 상태예요. 자동 검색 화면은 열지 않습니다.");
+        throw new Error("추천곡에 Spotify URI가 없어 앱 안에서 바로 재생할 수 없어요. Spotify에서 열기를 사용해 주세요.");
       }
       const { access } = await ensureSpotify();
       const sdkPlayer = await ensureSdkPlayer();
@@ -692,12 +692,8 @@ export default function SceneFM() {
 
   // 랜덤 재생 토글: 켜면 즉시 섞어서 첫 곡부터 재생, 끄면 플래그만 해제
   const onShuffle = useCallback(() => {
-    setShuffle((prev) => {
-      const next = !prev;
-      if (next) playCore((result && result.tracks) || [], { shuffle: true });
-      return next;
-    });
-  }, [playCore, result]);
+    setShuffle((prev) => !prev);
+  }, []);
 
   // 리스트에서 곡 클릭 → 그 곡을 현재 곡으로 두고 앱 내 재생 (현재 곡이면 토글)
   const onPlayTrack = useCallback((t) => {
@@ -1005,9 +1001,9 @@ function ErrorView({ msg, onRetry }) {
 }
 
 // ── Round icon button (shuffle / add) ──
-function RoundBtn({ onClick, label, children, accent = "#E0662A", active = false }) {
+function RoundBtn({ onClick, label, children, accent = "#E0662A", active = false, disabled = false }) {
   return (
-    <button onClick={onClick} aria-label={label} aria-pressed={active} title={label} style={{ position: "relative", width: 52, height: 52, borderRadius: "50%", border: active ? `2px solid ${accent}` : "none", background: active ? `${accent}1A` : STU.fill, color: active ? accent : STU.ink, display: "flex", alignItems: "center", justifyContent: "center", cursor: "pointer", flexShrink: 0 }}>
+    <button onClick={onClick} disabled={disabled} aria-label={label} aria-pressed={active} title={label} style={{ position: "relative", width: 52, height: 52, borderRadius: "50%", border: active ? `2px solid ${accent}` : "none", background: active ? `${accent}1A` : STU.fill, color: active ? accent : STU.ink, display: "flex", alignItems: "center", justifyContent: "center", cursor: disabled ? "not-allowed" : "pointer", opacity: disabled ? 0.38 : 1, flexShrink: 0 }}>
       {children}
       {active && <span style={{ position: "absolute", bottom: 7, width: 4, height: 4, borderRadius: "50%", background: accent }} />}
     </button>
@@ -1076,7 +1072,7 @@ function NowBar({ accent, player, first, onToggle, onPlay, onNext, onSeek, onOpe
 }
 
 // ── Track row (album-list style) ──
-function TrackRow({ t, accent, idx, current, playing, last, onPlay }) {
+function TrackRow({ t, accent, idx, current, playing, last }) {
   // 좌측 인덱스 영역: 현재 곡이면 play/pause 아이콘, 아니면 번호 (hover 시 재생 힌트)
   const indicator = current
     ? (playing
@@ -1085,7 +1081,7 @@ function TrackRow({ t, accent, idx, current, playing, last, onPlay }) {
     : <span className="sfm-lat" style={{ fontSize: 14, color: STU.faint }}>{idx}</span>;
   return (
     <div className="sfm-rise" style={{ animationDelay: `${Math.min(idx, 12) * 22}ms` }}>
-      <div role="button" tabIndex={0} onClick={() => onPlay(t)} onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); onPlay(t); } }}
+      <div role="button" tabIndex={0} onClick={() => window.open(spotifySearch(t.t, t.a), "_blank", "noopener")} onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); window.open(spotifySearch(t.t, t.a), "_blank", "noopener"); } }}
         style={{ display: "flex", alignItems: "center", gap: 14, padding: "12px 8px", borderRadius: 8, cursor: "pointer", color: STU.ink, background: current ? `${accent}10` : "transparent", transition: "background .15s" }}>
         <span style={{ width: 22, textAlign: "center", flexShrink: 0, display: "flex", justifyContent: "center" }}>{indicator}</span>
         <div style={{ flex: 1, minWidth: 0 }}>
@@ -1125,6 +1121,7 @@ function StationView({ result, shot, accent, accent2, onMood, busyMood, onRestar
 
   const saveDone = spotify.status === "done";
   const saveWorking = spotify.status === "connecting" || spotify.status === "working";
+  const canSaveSpotify = tracks.some(trackSpotifyUri);
 
   // 메인 CTA 라벨: 상태별로 명확히 구분
   const playLabel = working ? "준비 중…" : err ? "다시 재생" : playing ? "일시정지" : ready ? "재생" : "지금 이 플레이리스트 재생하기";
@@ -1146,7 +1143,7 @@ function StationView({ result, shot, accent, accent2, onMood, busyMood, onRestar
           <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", paddingTop: "max(env(safe-area-inset-top), 28px)" }}>
             <button onClick={onRestart} aria-label="다른 장면" style={{ width: 38, height: 38, borderRadius: "50%", border: "none", background: "rgba(255,255,255,.55)", backdropFilter: "blur(8px)", color: STU.ink, display: "flex", alignItems: "center", justifyContent: "center", cursor: "pointer", boxShadow: "0 1px 4px rgba(0,0,0,.08)" }}><ChevronLeft /></button>
             <Wordmark />
-            <button onClick={onSaveSpotify} aria-label="공유/저장" style={{ width: 38, height: 38, borderRadius: "50%", border: "none", background: "rgba(255,255,255,.55)", backdropFilter: "blur(8px)", color: STU.ink, display: "flex", alignItems: "center", justifyContent: "center", cursor: "pointer", boxShadow: "0 1px 4px rgba(0,0,0,.08)" }}><ShareIcon /></button>
+            <button onClick={onSaveSpotify} disabled={!canSaveSpotify || saveWorking} aria-label="공유/저장" title={canSaveSpotify ? "Spotify에 저장" : "Spotify URI가 없어 자동 저장할 수 없어요"} style={{ width: 38, height: 38, borderRadius: "50%", border: "none", background: "rgba(255,255,255,.55)", backdropFilter: "blur(8px)", color: STU.ink, display: "flex", alignItems: "center", justifyContent: "center", cursor: !canSaveSpotify || saveWorking ? "not-allowed" : "pointer", opacity: !canSaveSpotify || saveWorking ? 0.38 : 1, boxShadow: "0 1px 4px rgba(0,0,0,.08)" }}><ShareIcon /></button>
           </div>
 
           {/* spacer revealing the artwork */}
@@ -1159,13 +1156,13 @@ function StationView({ result, shot, accent, accent2, onMood, busyMood, onRestar
             {meta && <div className="sfm-lat" style={{ marginTop: 10, fontSize: 12.5, fontWeight: 600, letterSpacing: ".06em", color: accent }}>{meta}</div>}
           </div>
 
-          {/* action row: 셔플 토글 · 재생 CTA · 저장 */}
+          {/* action row: 셔플 토글 · Spotify 열기 CTA · 저장 */}
           <div style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: 14, margin: "20px 0 10px" }}>
             <RoundBtn onClick={onShuffle} label="랜덤 재생" active={shuffle} accent={accent}><ShuffleIcon /></RoundBtn>
-            <button onClick={ready ? onTogglePlay : onPlayInApp} style={{ flex: 1, maxWidth: 300, minHeight: 58, padding: "0 14px", display: "flex", alignItems: "center", justifyContent: "center", gap: 10, borderRadius: 999, border: "none", background: STU.ink, color: "#fff", cursor: "pointer", fontWeight: 800, fontSize: everPlayed ? 18 : 16, lineHeight: 1.15 }}>
-              {working ? <><span className="sfm-spin" style={{ width: 18, height: 18, borderRadius: "50%", border: "2px solid rgba(255,255,255,.35)", borderTopColor: "#fff", animation: "sfm-spin 1s linear infinite" }} /> 준비 중…</> : <>{playing ? <PauseIcon /> : <PlayIcon big />} {playLabel}</>}
+            <button onClick={onOpenSpotify} style={{ flex: 1, maxWidth: 300, minHeight: 58, padding: "0 14px", display: "flex", alignItems: "center", justifyContent: "center", gap: 10, borderRadius: 999, border: "none", background: STU.ink, color: "#fff", cursor: "pointer", fontWeight: 800, fontSize: 16, lineHeight: 1.15 }}>
+              <SpotifyIcon size={20} color="#fff" /> Spotify에서 재생하기
             </button>
-            <RoundBtn onClick={onSaveSpotify} label="Spotify에 저장">{saveDone ? <CheckIcon /> : <PlusIcon />}</RoundBtn>
+            <RoundBtn onClick={onSaveSpotify} label={canSaveSpotify ? "Spotify에 저장" : "Spotify URI가 없어 자동 저장할 수 없어요"} disabled={!canSaveSpotify || saveWorking}>{saveDone ? <CheckIcon /> : <PlusIcon />}</RoundBtn>
           </div>
 
           {/* 랜덤 재생 상태 표시 */}
@@ -1230,7 +1227,7 @@ function StationView({ result, shot, accent, accent2, onMood, busyMood, onRestar
               <span style={{ fontWeight: 700, color: STU.sub, marginLeft: 8 }}>{SECTIONS[g.s].ko}</span>
               <span style={{ color: STU.faint, marginLeft: 8 }}>· {SECTIONS[g.s].desc}</span>
             </div>
-            {g.items.map((t, j) => { n += 1; return <TrackRow key={n} t={t} idx={n} accent={accent} current={curName ? t.t === curName : false} playing={playing} onPlay={onPlayTrack} last={j === g.items.length - 1} />; })}
+            {g.items.map((t, j) => { n += 1; return <TrackRow key={n} t={t} idx={n} accent={accent} current={curName ? t.t === curName : false} playing={playing} last={j === g.items.length - 1} />; })}
           </div>
         ))}
       </div>
