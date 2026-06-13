@@ -7,7 +7,7 @@ import React, { useEffect, useRef, useState, useCallback } from "react";
 // ─────────────────────────────────────────────────────────────
 
 // ▼▼▼ Spotify 연동 설정 (SETUP.md 참고) ▼▼▼
-const SPOTIFY_CLIENT_ID = "YOUR_SPOTIFY_CLIENT_ID"; // developer.spotify.com 에서 발급
+const SPOTIFY_CLIENT_ID = "e51bc8c11879482a80216d21f42565cd"; // developer.spotify.com 에서 발급
 const SPOTIFY_REDIRECT_URI =
   typeof window !== "undefined" ? window.location.origin + window.location.pathname : "";
 const SPOTIFY_SCOPES = "playlist-modify-private playlist-modify-public";
