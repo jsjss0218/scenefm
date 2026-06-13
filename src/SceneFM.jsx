@@ -7,7 +7,7 @@ import React, { useEffect, useRef, useState, useCallback } from "react";
 // ─────────────────────────────────────────────────────────────
 
 // ▼▼▼ Spotify 연동 설정 (SETUP.md 참고) ▼▼▼
-const SPOTIFY_CLIENT_ID = "e51bc8c11879482a80216d21f42565cd"; // developer.spotify.com 에서 발급
+const SPOTIFY_CLIENT_ID = "YOUR_SPOTIFY_CLIENT_ID"; // developer.spotify.com 에서 발급
 const SPOTIFY_REDIRECT_URI =
   typeof window !== "undefined" ? window.location.origin + window.location.pathname : "";
 const SPOTIFY_SCOPES = "playlist-modify-private playlist-modify-public";
@@ -77,6 +77,45 @@ function videoFrameToJpeg(video, maxDim = 1024, quality = 0.82) {
   c.getContext("2d").drawImage(video, 0, 0, c.width, c.height);
   return c.toDataURL("image/jpeg", quality);
 }
+// 라이브 카메라에서 n장의 프레임을 일정 간격으로 캡처 (영상 모드)
+function captureLiveFrames(video, n = 3, gap = 600) {
+  return new Promise((resolve) => {
+    const out = [];
+    const grab = () => {
+      try { out.push(videoFrameToJpeg(video)); } catch {}
+      if (out.length >= n) resolve(out);
+      else setTimeout(grab, gap);
+    };
+    grab();
+  });
+}
+// 업로드한 영상 파일에서 3개 시점의 프레임을 추출 (영상 모드)
+function sampleVideoFile(file, maxDim = 1024, quality = 0.82) {
+  return new Promise((resolve, reject) => {
+    const url = URL.createObjectURL(file);
+    const v = document.createElement("video");
+    v.preload = "metadata"; v.muted = true; v.playsInline = true; v.src = url;
+    v.onloadedmetadata = async () => {
+      const dur = v.duration || 1;
+      const times = [dur * 0.2, dur * 0.5, dur * 0.8];
+      const frames = [];
+      const seek = (t) => new Promise((res) => { v.onseeked = res; v.currentTime = Math.min(t, dur - 0.05); });
+      try {
+        for (const t of times) {
+          await seek(t);
+          const scale = Math.min(1, maxDim / Math.max(v.videoWidth, v.videoHeight));
+          const c = document.createElement("canvas");
+          c.width = Math.round(v.videoWidth * scale); c.height = Math.round(v.videoHeight * scale);
+          c.getContext("2d").drawImage(v, 0, 0, c.width, c.height);
+          frames.push(c.toDataURL("image/jpeg", quality));
+        }
+        URL.revokeObjectURL(url);
+        resolve(frames.length ? frames : reject(new Error("영상에서 프레임을 추출하지 못했어요.")));
+      } catch (e) { URL.revokeObjectURL(url); reject(new Error("영상을 처리하지 못했어요.")); }
+    };
+    v.onerror = () => { URL.revokeObjectURL(url); reject(new Error("영상을 불러오지 못했어요.")); };
+  });
+}
 function extractJson(text) {
   let t = text.replace(/```json/gi, "").replace(/```/g, "").trim();
   const a = t.indexOf("{"), b = t.lastIndexOf("}");
@@ -85,10 +124,17 @@ function extractJson(text) {
 }
 
 // ── Anthropic vision call (claude.ai 아티팩트 프록시 사용; 배포 시 백엔드 프록시 필요 — SETUP.md) ──
-async function callSceneFM(dataUrl, modifier) {
-  const base64 = dataUrl.split(",")[1];
+async function callSceneFM(frames, modifier) {
+  const list = Array.isArray(frames) ? frames : [frames];
+  const imageBlocks = list.map((d) => ({
+    type: "image", source: { type: "base64", media_type: "image/jpeg", data: d.split(",")[1] },
+  }));
+  const isVideo = list.length > 1;
   const system =
     "You are the recommendation engine for Scene FM, an app that turns the scene in front of the user into a ready-to-play playlist. " +
+    (isVideo
+      ? "The images are sequential frames from a short video clip — read motion, speed and how the scene changes over time, not just a still. "
+      : "") +
     "Read the photo for place, time of day, color, movement, weather, emotion and era, then translate them into genre, era, BPM, sound texture and a playlist with an energy arc. " +
     "Recommend REAL, well-known existing songs that genuinely fit the scene. " +
     "Reply with ONLY minified JSON — no code fences, no commentary. " +
@@ -108,7 +154,7 @@ async function callSceneFM(dataUrl, modifier) {
     body: JSON.stringify({
       model: "claude-sonnet-4-6", max_tokens: 1000, system,
       messages: [{ role: "user", content: [
-        { type: "image", source: { type: "base64", media_type: "image/jpeg", data: base64 } },
+        ...imageBlocks,
         { type: "text", text: userText },
       ] }],
     }),
@@ -194,8 +240,11 @@ async function spPost(token, path, body) {
 }
 async function searchTrackUri(token, t, a) {
   const tryQ = async (q) => {
-    const d = await spGet(token, "/search?type=track&limit=5&q=" + enc(q));
-    return d.tracks && d.tracks.items && d.tracks.items[0] ? d.tracks.items[0].uri : null;
+    try {
+      const d = await spGet(token, "/search?type=track&limit=5&market=from_token&q=" + enc(q));
+      const item = d.tracks && d.tracks.items && d.tracks.items[0];
+      return item && typeof item.uri === "string" && item.uri.startsWith("spotify:track:") ? item.uri : null;
+    } catch { return null; }
   };
   return (await tryQ(`track:${t} artist:${a}`)) || (await tryQ(`${t} ${a}`));
 }
@@ -207,7 +256,9 @@ export default function SceneFM() {
   const params = typeof window !== "undefined" ? new URLSearchParams(window.location.search) : new URLSearchParams();
   const isAuthCallback = typeof window !== "undefined" && !!window.opener && (params.has("code") || params.has("error"));
 
-  const [stage, setStage] = useState("capture");
+  const [stage, setStage] = useState("home");
+  const [mode, setMode] = useState("photo"); // photo | video
+  const [recording, setRecording] = useState(false);
   const [shot, setShot] = useState(null);
   const [result, setResult] = useState(null);
   const [error, setError] = useState("");
@@ -217,6 +268,7 @@ export default function SceneFM() {
   const videoRef = useRef(null);
   const streamRef = useRef(null);
   const fileRef = useRef(null);
+  const videoFileRef = useRef(null);
   const tokenRef = useRef({ access: null, userId: null });
 
   const accent = result?.palette?.accent || "#FF8C42";
@@ -247,15 +299,16 @@ export default function SceneFM() {
     return () => { cancelled = true; if (streamRef.current) { streamRef.current.getTracks().forEach((t) => t.stop()); streamRef.current = null; } };
   }, [stage, isAuthCallback]);
 
-  const analyze = useCallback(async (dataUrl, modifier) => {
-    setShot(dataUrl);
+  const analyze = useCallback(async (frames, modifier) => {
+    const list = Array.isArray(frames) ? frames : [frames];
+    setShot(list[0]);
     if (streamRef.current) { streamRef.current.getTracks().forEach((t) => t.stop()); streamRef.current = null; }
-    setLiveCam(false);
+    setLiveCam(false); setRecording(false);
     setSpotify({ status: "idle", progress: "", url: "", matched: 0, total: 0, error: "" });
     if (!modifier) setStage("analyzing");
     setError("");
     try {
-      const r = await callSceneFM(dataUrl, modifier);
+      const r = await callSceneFM(modifier ? list : list, modifier);
       setResult(r); setStage("station");
     } catch (e) {
       setError(e.message || "장면을 읽지 못했어요.");
@@ -275,36 +328,55 @@ export default function SceneFM() {
       }
       const { access, userId } = tokenRef.current;
       setSpotify((s) => ({ ...s, status: "working", progress: "곡을 찾는 중…" }));
-      const uris = []; let done = 0;
+      const seen = new Set(); const uris = []; let done = 0;
       for (const t of tracks) {
-        try { const uri = await searchTrackUri(access, t.t, t.a); if (uri) uris.push(uri); } catch {}
+        const uri = await searchTrackUri(access, t.t, t.a);
+        if (uri && !seen.has(uri)) { seen.add(uri); uris.push(uri); }
         done++;
         setSpotify((s) => ({ ...s, progress: `곡을 찾는 중 ${done}/${tracks.length}`, matched: uris.length }));
       }
-      if (!uris.length) throw new Error("Spotify에서 매칭되는 곡을 찾지 못했어요.");
-      setSpotify((s) => ({ ...s, progress: "플레이리스트 만드는 중…" }));
+      if (!uris.length) throw new Error("이 장면의 곡들이 Spotify에 없어 플레이리스트를 만들지 못했어요.");
+      setSpotify((s) => ({ ...s, progress: `${uris.length}곡으로 플레이리스트 만드는 중…` }));
       const desc = (result.tagline ? result.tagline + " · " : "") + "Made by Scene FM";
       const pl = await spPost(access, `/users/${userId}/playlists`, {
         name: result.station || "Scene FM", description: desc, public: false,
       });
-      await spPost(access, `/playlists/${pl.id}/tracks`, { uris });
+      // Spotify에 있는 곡만으로 생성 (100곡 단위 배치)
+      for (let i = 0; i < uris.length; i += 100) {
+        await spPost(access, `/playlists/${pl.id}/tracks`, { uris: uris.slice(i, i + 100) });
+      }
       setSpotify({ status: "done", url: pl.external_urls?.spotify || "", matched: uris.length, total: tracks.length, progress: "", error: "" });
     } catch (e) {
       setSpotify((s) => ({ ...s, status: "error", error: e.message || "저장에 실패했어요.", progress: "" }));
     }
   }, [result]);
 
-  const onShutter = () => {
-    if (liveCam && videoRef.current && videoRef.current.videoWidth) analyze(videoFrameToJpeg(videoRef.current));
+  const onShutter = async () => {
+    if (mode === "video") {
+      if (liveCam && videoRef.current && videoRef.current.videoWidth) {
+        setRecording(true);
+        const frames = await captureLiveFrames(videoRef.current, 3, 600);
+        analyze(frames);
+      } else { videoFileRef.current?.click(); }
+      return;
+    }
+    if (liveCam && videoRef.current && videoRef.current.videoWidth) analyze([videoFrameToJpeg(videoRef.current)]);
     else fileRef.current?.click();
   };
   const onPick = async (e) => {
     const f = e.target.files?.[0]; if (!f) return;
-    try { analyze(await fileToScaledJpeg(f)); } catch (err) { setError(err.message); setStage("error"); }
+    try { analyze([await fileToScaledJpeg(f)]); } catch (err) { setError(err.message); setStage("error"); }
+    e.target.value = "";
+  };
+  const onPickVideo = async (e) => {
+    const f = e.target.files?.[0]; if (!f) return;
+    setStage("analyzing");
+    try { analyze(await sampleVideoFile(f)); } catch (err) { setError(err.message); setStage("error"); }
     e.target.value = "";
   };
   const adjustMood = (key) => { setBusyMood(key); analyze(shot, key); };
-  const restart = () => { setResult(null); setShot(null); setError(""); setStage("capture"); setSpotify({ status: "idle", progress: "", url: "", matched: 0, total: 0, error: "" }); };
+  const restart = () => { setResult(null); setShot(null); setError(""); setStage("capture"); setRecording(false); setSpotify({ status: "idle", progress: "", url: "", matched: 0, total: 0, error: "" }); };
+  const goCapture = () => { setError(""); setStage("capture"); };
 
   if (isAuthCallback) {
     return (
@@ -320,8 +392,12 @@ export default function SceneFM() {
     <div className="sfm-body" style={root}>
       <style>{FONT_CSS}</style>
       <input ref={fileRef} type="file" accept="image/*" capture="environment" onChange={onPick} style={{ display: "none" }} />
+      <input ref={videoFileRef} type="file" accept="video/*" capture="environment" onChange={onPickVideo} style={{ display: "none" }} />
       <div style={{ maxWidth: 480, margin: "0 auto", minHeight: "100%", position: "relative" }}>
-        {stage === "capture" && <CaptureView liveCam={liveCam} videoRef={videoRef} onShutter={onShutter} onUpload={() => fileRef.current?.click()} />}
+        {stage === "home" && <HomeView onStart={goCapture} />}
+        {stage === "capture" && <CaptureView liveCam={liveCam} videoRef={videoRef} onShutter={onShutter}
+          onUpload={() => (mode === "video" ? videoFileRef : fileRef).current?.click()}
+          mode={mode} setMode={setMode} recording={recording} />}
         {stage === "analyzing" && <AnalyzingView shot={shot} accent={accent} />}
         {stage === "error" && <ErrorView msg={error} onRetry={restart} />}
         {stage === "station" && result && (
@@ -343,26 +419,74 @@ function Wordmark({ freq = "88.3", accent = "#FF8C42" }) {
   );
 }
 
-function CaptureView({ liveCam, videoRef, onShutter, onUpload }) {
+function HomeView({ onStart }) {
+  return (
+    <div style={{ height: "100dvh", minHeight: 560, display: "flex", flexDirection: "column", justifyContent: "center", alignItems: "center", padding: 28, textAlign: "center", position: "relative" }}>
+      <div style={{ position: "absolute", inset: 0, background: "radial-gradient(90% 60% at 50% 25%, #1c2536 0%, #0a0c12 75%)" }} />
+      <div style={{ position: "relative" }} className="sfm-rise">
+        <div className="sfm-mono" style={{ fontSize: 12, color: "#FF8C42", letterSpacing: ".2em", marginBottom: 10 }}>◉ 88.3 MHz</div>
+        <h1 className="sfm-display" style={{ fontSize: 72, margin: "0 0 2px", lineHeight: .9 }}>SCENE&nbsp;FM</h1>
+        <p style={{ fontSize: 15, color: "#cfd3dd", margin: "10px 0 4px" }}>지금 이 순간을, 플레이리스트로.</p>
+        <p style={{ fontSize: 13, color: "#8b92a3", margin: "0 0 36px", lineHeight: 1.6 }}>
+          장면을 찍으면 AI가 장소·빛·색감·속도감을 읽고<br />그 순간에 어울리는 방송국을 만들어 드려요.
+        </p>
+        <button onClick={onStart} style={{ ...solidBtn, background: "#F4F1E8", color: "#0a0c12", padding: "15px 44px", fontSize: 16 }}>
+          시작하기
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function ModeToggle({ mode, setMode }) {
+  const opt = (key, label) => (
+    <button onClick={() => setMode(key)} style={{
+      padding: "7px 18px", borderRadius: 999, fontSize: 13, fontWeight: 700, cursor: "pointer", border: "none",
+      background: mode === key ? "#F4F1E8" : "transparent", color: mode === key ? "#0a0c12" : "#cfd3dd",
+    }}>{label}</button>
+  );
+  return (
+    <div style={{ display: "inline-flex", gap: 4, padding: 4, borderRadius: 999, background: "rgba(10,12,18,.6)", border: "1px solid rgba(244,241,232,.18)", backdropFilter: "blur(6px)" }}>
+      {opt("photo", "사진")}{opt("video", "영상")}
+    </div>
+  );
+}
+
+function CaptureView({ liveCam, videoRef, onShutter, onUpload, mode, setMode, recording }) {
+  const isVideo = mode === "video";
   return (
     <div style={{ position: "relative", height: "100dvh", minHeight: 560, display: "flex", flexDirection: "column" }}>
       <div style={{ position: "absolute", inset: 0, overflow: "hidden" }}>
         <video ref={videoRef} muted playsInline style={{ width: "100%", height: "100%", objectFit: "cover", opacity: liveCam ? 0.9 : 0, transition: "opacity .4s", filter: "saturate(1.05)" }} />
         {!liveCam && <div style={{ position: "absolute", inset: 0, background: "radial-gradient(80% 60% at 50% 35%, #1b2233 0%, #0a0c12 80%)" }} />}
         <div style={{ position: "absolute", inset: 0, background: "linear-gradient(180deg, rgba(7,8,13,.7) 0%, rgba(7,8,13,0) 30%, rgba(7,8,13,.85) 100%)" }} />
+        {recording && <div style={{ position: "absolute", inset: 0, border: "3px solid #ff5a4d", boxSizing: "border-box" }} />}
       </div>
-      <div style={{ position: "relative", padding: "22px 22px 0" }} className="sfm-rise"><Wordmark /></div>
+      <div style={{ position: "relative", padding: "22px 22px 0", display: "flex", justifyContent: "space-between", alignItems: "center" }} className="sfm-rise">
+        <Wordmark />
+        <ModeToggle mode={mode} setMode={setMode} />
+      </div>
       <div style={{ position: "relative", marginTop: "auto", padding: "0 22px", textAlign: "center" }} className="sfm-rise">
         <div style={{ display: "inline-flex", alignItems: "center", gap: 8, marginBottom: 14, padding: "5px 11px", borderRadius: 999, border: "1px solid rgba(244,241,232,.18)", background: "rgba(10,12,18,.5)" }}>
           <Dot live={liveCam} />
-          <span className="sfm-mono" style={{ fontSize: 11, color: "#cfd3dd" }}>{liveCam ? "카메라 ON · 장면 입력 대기" : "탭하면 카메라가 열려요"}</span>
+          <span className="sfm-mono" style={{ fontSize: 11, color: "#cfd3dd" }}>
+            {recording ? "녹화 중 · 움직임을 읽는 중…" : liveCam ? "카메라 ON · 장면 입력 대기" : "탭하면 카메라가 열려요"}
+          </span>
         </div>
-        <h1 className="sfm-display" style={{ fontSize: 38, margin: "0 0 6px" }}>지금 보는 장면을 찍으세요</h1>
-        <p style={{ fontSize: 14, color: "#9aa0ad", margin: "0 0 26px", lineHeight: 1.5 }}>AI가 장소·빛·색감·속도감·시대감을 읽고<br />그 순간의 플레이리스트를 바로 만듭니다.</p>
+        <h1 className="sfm-display" style={{ fontSize: 38, margin: "0 0 6px" }}>
+          {isVideo ? "움직이는 장면을 담으세요" : "지금 보는 장면을 찍으세요"}
+        </h1>
+        <p style={{ fontSize: 14, color: "#9aa0ad", margin: "0 0 26px", lineHeight: 1.5 }}>
+          {isVideo
+            ? <>몇 초간의 움직임에서 속도감과 흐름을 읽어<br />더 정확한 플레이리스트를 만듭니다.</>
+            : <>AI가 장소·빛·색감·속도감·시대감을 읽고<br />그 순간의 플레이리스트를 바로 만듭니다.</>}
+        </p>
       </div>
       <div style={{ position: "relative", padding: "0 22px 34px", display: "flex", alignItems: "center", justifyContent: "center", gap: 28 }} className="sfm-rise">
-        <button onClick={onUpload} aria-label="앨범에서 가져오기" style={ghostBtn}><GalleryIcon /><span style={{ fontSize: 11, marginTop: 4 }}>앨범</span></button>
-        <button onClick={onShutter} aria-label="촬영" style={shutterBtn}><span style={{ position: "absolute", inset: 7, borderRadius: "50%", background: "#F4F1E8", boxShadow: "inset 0 0 0 2px #0a0c12" }} /></button>
+        <button onClick={onUpload} aria-label={isVideo ? "영상 가져오기" : "앨범에서 가져오기"} style={ghostBtn}><GalleryIcon /><span style={{ fontSize: 11, marginTop: 4 }}>{isVideo ? "영상" : "앨범"}</span></button>
+        <button onClick={onShutter} disabled={recording} aria-label="촬영" style={shutterBtn}>
+          <span style={{ position: "absolute", inset: isVideo ? 22 : 7, borderRadius: isVideo ? 8 : "50%", background: isVideo ? "#ff5a4d" : "#F4F1E8", boxShadow: "inset 0 0 0 2px #0a0c12", transition: "all .2s" }} />
+        </button>
         <div style={{ width: 52 }} />
       </div>
     </div>
