@@ -10,7 +10,7 @@ import React, { useEffect, useRef, useState, useCallback } from "react";
 const SPOTIFY_CLIENT_ID = "e51bc8c11879482a80216d21f42565cd"; // developer.spotify.com 에서 발급
 const SPOTIFY_REDIRECT_URI =
   typeof window !== "undefined" ? window.location.origin + window.location.pathname : "";
-const SPOTIFY_SCOPES = "playlist-modify-private playlist-modify-public";
+const SPOTIFY_SCOPES = "playlist-modify-private playlist-modify-public streaming user-read-email user-read-private";
 // ▲▲▲ 이 앱이 등록된 Redirect URI 와 SPOTIFY_REDIRECT_URI 가 정확히 일치해야 합니다 ▲▲▲
 
 const FONT_CSS = `
@@ -238,6 +238,28 @@ async function spPost(token, path, body) {
   if (!res.ok) throw new Error("Spotify 요청 실패 (" + res.status + ")");
   return res.json();
 }
+async function spPut(token, path, body) {
+  const res = await fetch("https://api.spotify.com/v1" + path, {
+    method: "PUT", headers: { Authorization: "Bearer " + token, "Content-Type": "application/json" },
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  if (!res.ok && res.status !== 204) throw new Error("Spotify 요청 실패 (" + res.status + ")");
+  return res.status === 204 ? null : res.json().catch(() => null);
+}
+// Web Playback SDK 스크립트를 1회만 로드
+let sdkPromise = null;
+function loadSpotifySdk() {
+  if (window.Spotify) return Promise.resolve();
+  if (sdkPromise) return sdkPromise;
+  sdkPromise = new Promise((resolve, reject) => {
+    window.onSpotifyWebPlaybackSDKReady = () => resolve();
+    const s = document.createElement("script");
+    s.src = "https://sdk.scdn.co/spotify-player.js";
+    s.onerror = () => reject(new Error("Spotify 플레이어를 불러오지 못했어요."));
+    document.body.appendChild(s);
+  });
+  return sdkPromise;
+}
 async function searchTrackUri(token, t, a) {
   const tryQ = async (q) => {
     try {
@@ -316,25 +338,42 @@ export default function SceneFM() {
     } finally { setBusyMood(""); }
   }, []);
 
+  const [player, setPlayer] = useState({
+    status: "idle", // idle | connecting | resolving | ready | error
+    deviceId: "", uris: [], index: 0, isPlaying: false,
+    track: null, progressMs: 0, durationMs: 0, error: "", premiumRequired: false,
+  });
+  const playerRef = useRef(null);
+
+  const ensureSpotify = useCallback(async () => {
+    if (!tokenRef.current.access) {
+      const access = await spotifyAuthorize();
+      tokenRef.current.access = access;
+      tokenRef.current.userId = (await spGet(access, "/me")).id;
+    }
+    return tokenRef.current;
+  }, []);
+
+  const resolveQueueUris = useCallback(async (access, tracks, onProgress) => {
+    const seen = new Set(); const uris = []; let done = 0;
+    for (const t of tracks) {
+      const uri = await searchTrackUri(access, t.t, t.a);
+      if (uri && !seen.has(uri)) { seen.add(uri); uris.push(uri); }
+      done++;
+      onProgress && onProgress(done, uris.length);
+    }
+    return uris;
+  }, []);
+
   const saveToSpotify = useCallback(async () => {
     const tracks = (result && result.tracks) || [];
     if (!tracks.length) return;
     try {
       setSpotify({ status: "connecting", progress: "Spotify 연결 중…", url: "", matched: 0, total: tracks.length, error: "" });
-      if (!tokenRef.current.access) {
-        const access = await spotifyAuthorize();
-        tokenRef.current.access = access;
-        tokenRef.current.userId = (await spGet(access, "/me")).id;
-      }
-      const { access, userId } = tokenRef.current;
+      const { access, userId } = await ensureSpotify();
       setSpotify((s) => ({ ...s, status: "working", progress: "곡을 찾는 중…" }));
-      const seen = new Set(); const uris = []; let done = 0;
-      for (const t of tracks) {
-        const uri = await searchTrackUri(access, t.t, t.a);
-        if (uri && !seen.has(uri)) { seen.add(uri); uris.push(uri); }
-        done++;
-        setSpotify((s) => ({ ...s, progress: `곡을 찾는 중 ${done}/${tracks.length}`, matched: uris.length }));
-      }
+      const uris = await resolveQueueUris(access, tracks, (done, matched) =>
+        setSpotify((s) => ({ ...s, progress: `곡을 찾는 중 ${done}/${tracks.length}`, matched })));
       if (!uris.length) throw new Error("이 장면의 곡들이 Spotify에 없어 플레이리스트를 만들지 못했어요.");
       setSpotify((s) => ({ ...s, progress: `${uris.length}곡으로 플레이리스트 만드는 중…` }));
       const desc = (result.tagline ? result.tagline + " · " : "") + "Made by Scene FM";
@@ -350,6 +389,69 @@ export default function SceneFM() {
       setSpotify((s) => ({ ...s, status: "error", error: e.message || "저장에 실패했어요.", progress: "" }));
     }
   }, [result]);
+
+  // 앱 내 재생 시작: Premium 계정으로 SDK 플레이어를 띄우고 곡 큐를 순서대로 재생
+  const playInApp = useCallback(async () => {
+    const tracks = (result && result.tracks) || [];
+    if (!tracks.length) return;
+    try {
+      setPlayer((p) => ({ ...p, status: "connecting", error: "", premiumRequired: false }));
+      const { access } = await ensureSpotify();
+
+      setPlayer((p) => ({ ...p, status: "resolving" }));
+      const uris = await resolveQueueUris(access, tracks);
+      if (!uris.length) throw new Error("이 장면의 곡들이 Spotify에 없어요.");
+
+      await loadSpotifySdk();
+      let sdkPlayer = playerRef.current;
+      if (!sdkPlayer) {
+        sdkPlayer = new window.Spotify.Player({
+          name: "Scene FM",
+          getOAuthToken: (cb) => cb(tokenRef.current.access),
+          volume: 0.85,
+        });
+        sdkPlayer.addListener("initialization_error", ({ message }) =>
+          setPlayer((p) => ({ ...p, status: "error", error: message })));
+        sdkPlayer.addListener("authentication_error", () =>
+          setPlayer((p) => ({ ...p, status: "error", error: "인증이 만료됐어요. 다시 로그인해 주세요.", premiumRequired: false })));
+        sdkPlayer.addListener("account_error", () =>
+          setPlayer((p) => ({ ...p, status: "error", error: "Spotify Premium 계정이 필요해요.", premiumRequired: true })));
+        sdkPlayer.addListener("playback_error", ({ message }) =>
+          setPlayer((p) => ({ ...p, error: message })));
+        sdkPlayer.addListener("player_state_changed", (s) => {
+          if (!s) return;
+          const cur = s.track_window?.current_track;
+          setPlayer((p) => ({
+            ...p,
+            isPlaying: !s.paused,
+            progressMs: s.position, durationMs: s.duration,
+            track: cur ? { name: cur.name, artist: (cur.artists || []).map((a) => a.name).join(", "), art: cur.album?.images?.[0]?.url } : p.track,
+            index: Math.max(0, uris.indexOf(cur?.uri)) ,
+          }));
+        });
+        sdkPlayer.addListener("ready", ({ device_id }) => {
+          playerRef.current = sdkPlayer;
+          setPlayer((p) => ({ ...p, status: "ready", deviceId: device_id, uris, index: 0 }));
+          spPut(tokenRef.current.access, "/me/player", { device_ids: [device_id], play: false }).catch(() => {});
+          spPut(tokenRef.current.access, `/me/player/play?device_id=${device_id}`, { uris }).catch((e) =>
+            setPlayer((p) => ({ ...p, error: e.message })));
+        });
+        await sdkPlayer.connect();
+      } else {
+        setPlayer((p) => ({ ...p, status: "ready", uris, index: 0 }));
+        spPut(tokenRef.current.access, `/me/player/play?device_id=${player.deviceId}`, { uris }).catch((e) =>
+          setPlayer((p) => ({ ...p, error: e.message })));
+      }
+    } catch (e) {
+      setPlayer((p) => ({ ...p, status: "error", error: e.message || "재생을 시작하지 못했어요." }));
+    }
+  }, [result, ensureSpotify, resolveQueueUris, player.deviceId]);
+
+  const togglePlay = useCallback(() => { playerRef.current?.togglePlay(); }, []);
+  const nextTrack = useCallback(() => { playerRef.current?.nextTrack(); }, []);
+  const prevTrack = useCallback(() => { playerRef.current?.previousTrack(); }, []);
+
+  useEffect(() => () => { playerRef.current?.disconnect(); }, []);
 
   const onShutter = async () => {
     if (mode === "video") {
@@ -375,7 +477,11 @@ export default function SceneFM() {
     e.target.value = "";
   };
   const adjustMood = (key) => { setBusyMood(key); analyze(shot, key); };
-  const restart = () => { setResult(null); setShot(null); setError(""); setStage("capture"); setRecording(false); setSpotify({ status: "idle", progress: "", url: "", matched: 0, total: 0, error: "" }); };
+  const restart = () => {
+    if (playerRef.current) { try { playerRef.current.pause(); } catch {} try { playerRef.current.disconnect(); } catch {} playerRef.current = null; }
+    setPlayer({ status: "idle", deviceId: "", uris: [], index: 0, isPlaying: false, track: null, progressMs: 0, durationMs: 0, error: "", premiumRequired: false });
+    setResult(null); setShot(null); setError(""); setStage("capture"); setRecording(false); setSpotify({ status: "idle", progress: "", url: "", matched: 0, total: 0, error: "" });
+  };
   const goCapture = () => { setError(""); setStage("capture"); };
 
   if (isAuthCallback) {
@@ -403,7 +509,8 @@ export default function SceneFM() {
         {stage === "station" && result && (
           <StationView result={result} shot={shot} accent={accent} accent2={accent2}
             onMood={adjustMood} busyMood={busyMood} onRestart={restart} error={error}
-            spotify={spotify} onSaveSpotify={saveToSpotify} />
+            spotify={spotify} onSaveSpotify={saveToSpotify}
+            player={player} onPlayInApp={playInApp} onTogglePlay={togglePlay} onNext={nextTrack} onPrev={prevTrack} />
         )}
       </div>
     </div>
@@ -524,7 +631,7 @@ function ErrorView({ msg, onRetry }) {
   );
 }
 
-function StationView({ result, shot, accent, accent2, onMood, busyMood, onRestart, error, spotify, onSaveSpotify }) {
+function StationView({ result, shot, accent, accent2, onMood, busyMood, onRestart, error, spotify, onSaveSpotify, player, onPlayInApp, onTogglePlay, onNext, onPrev }) {
   const tracks = Array.isArray(result.tracks) ? result.tracks : [];
   const grouped = [1, 2, 3, 4, 5].map((s) => ({ s, items: tracks.filter((t) => Number(t.s) === s) })).filter((g) => g.items.length);
   const sceneOrder = [["place", "장소"], ["time", "시간대"], ["color", "색감"], ["motion", "움직임"], ["weather", "날씨"], ["emotion", "감정"], ["era", "시대감"]];
@@ -543,11 +650,8 @@ function StationView({ result, shot, accent, accent2, onMood, busyMood, onRestar
       </div>
 
       <div style={{ padding: "16px 20px 0" }}>
-        {first && (
-          <a href={ytmusic(first.t, first.a)} target="_blank" rel="noreferrer" style={{ ...solidBtn, width: "100%", boxSizing: "border-box", textDecoration: "none", background: accent, color: "#0a0c12", display: "flex", alignItems: "center", justifyContent: "center", gap: 8 }}>
-            <PlayIcon /> 첫 곡부터 듣기
-          </a>
-        )}
+        {/* 앱 내 재생 (Spotify Premium · Web Playback SDK) */}
+        <InAppPlayer accent={accent} player={player} onPlay={onPlayInApp} onToggle={onTogglePlay} onNext={onNext} onPrev={onPrev} first={first} />
 
         {/* Spotify 자동 저장 (2단계) */}
         <SpotifySave spotify={spotify} onSave={onSaveSpotify} total={tracks.length} />
@@ -614,6 +718,88 @@ function StationView({ result, shot, accent, accent2, onMood, busyMood, onRestar
     </div>
   );
 }
+
+function fmtTime(ms) {
+  const s = Math.floor((ms || 0) / 1000);
+  return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`;
+}
+
+function InAppPlayer({ accent, player, onPlay, onToggle, onNext, onPrev, first }) {
+  const GREEN = "#1DB954";
+  const base = { borderRadius: 14, padding: "14px 16px", border: "1px solid rgba(244,241,232,.1)", background: "rgba(20,24,34,.6)" };
+
+  if (player.status === "ready" || player.status === "resolving" || player.status === "connecting") {
+    const working = player.status !== "ready";
+    const pct = player.durationMs ? Math.min(100, (player.progressMs / player.durationMs) * 100) : 0;
+    return (
+      <div style={base}>
+        {working ? (
+          <div style={{ display: "flex", alignItems: "center", gap: 10, padding: "4px 0" }}>
+            <div className="sfm-spin" style={{ width: 20, height: 20, borderRadius: "50%", border: "2px solid rgba(244,241,232,.15)", borderTopColor: accent, animation: "sfm-spin 1s linear infinite" }} />
+            <span className="sfm-mono" style={{ fontSize: 12, color: "#cfd3dd" }}>
+              {player.status === "connecting" ? "Spotify 연결 중…" : "곡을 찾는 중…"}
+            </span>
+          </div>
+        ) : (
+          <>
+            <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
+              {player.track?.art && <img src={player.track.art} alt="" style={{ width: 48, height: 48, borderRadius: 8, objectFit: "cover" }} />}
+              <div style={{ flex: 1, minWidth: 0 }}>
+                <div style={{ fontSize: 14, fontWeight: 700, color: "#F4F1E8", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                  {player.track?.name || "재생 준비 중…"}
+                </div>
+                <div className="sfm-mono" style={{ fontSize: 11, color: "#9aa0ad", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                  {player.track?.artist || ""}
+                </div>
+              </div>
+              <button onClick={onPrev} aria-label="이전 곡" style={iconBtn}><PrevIcon /></button>
+              <button onClick={onToggle} aria-label="재생/일시정지" style={{ ...iconBtn, width: 40, height: 40, background: accent, color: "#0a0c12" }}>
+                {player.isPlaying ? <PauseIcon /> : <PlayIcon />}
+              </button>
+              <button onClick={onNext} aria-label="다음 곡" style={iconBtn}><NextIcon /></button>
+            </div>
+            <div style={{ marginTop: 10, height: 3, borderRadius: 2, background: "rgba(244,241,232,.12)", overflow: "hidden" }}>
+              <div style={{ width: `${pct}%`, height: "100%", background: accent, transition: "width .25s linear" }} />
+            </div>
+            <div style={{ display: "flex", justifyContent: "space-between", marginTop: 4 }}>
+              <span className="sfm-mono" style={{ fontSize: 10, color: "#6b7180" }}>{fmtTime(player.progressMs)}</span>
+              <span className="sfm-mono" style={{ fontSize: 10, color: "#6b7180" }}>{fmtTime(player.durationMs)}</span>
+            </div>
+          </>
+        )}
+        {player.error && <p style={{ fontSize: 11, color: "#ff9b8a", margin: "8px 2px 0" }}>{player.error}</p>}
+      </div>
+    );
+  }
+
+  if (player.status === "error") {
+    return (
+      <div style={base}>
+        <p style={{ fontSize: 13, color: "#e6e2d8", margin: "0 0 10px" }}>
+          {player.premiumRequired ? "앱 내 재생은 Spotify Premium 계정에서만 가능해요." : (player.error || "앱 내 재생을 시작하지 못했어요.")}
+        </p>
+        <div style={{ display: "flex", gap: 8 }}>
+          <button onClick={onPlay} style={{ ...solidBtn, flex: 1, background: GREEN, color: "#fff" }}>다시 시도</button>
+          {first && (
+            <a href={ytmusic(first.t, first.a)} target="_blank" rel="noreferrer" style={{ ...solidBtn, flex: 1, textAlign: "center", textDecoration: "none", background: "rgba(244,241,232,.12)", color: "#e6e2d8" }}>
+              YouTube Music에서 듣기
+            </a>
+          )}
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <button onClick={onPlay} style={{ ...solidBtn, width: "100%", boxSizing: "border-box", display: "flex", alignItems: "center", justifyContent: "center", gap: 9, background: accent, color: "#0a0c12" }}>
+      <PlayIcon /> 앱에서 바로 재생 (Spotify Premium)
+    </button>
+  );
+}
+const iconBtn = { width: 32, height: 32, borderRadius: "50%", border: "none", background: "rgba(244,241,232,.12)", color: "#F4F1E8", display: "flex", alignItems: "center", justifyContent: "center", cursor: "pointer" };
+function PauseIcon() { return <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><rect x="6" y="4" width="4" height="16" /><rect x="14" y="4" width="4" height="16" /></svg>; }
+function PrevIcon() { return <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><path d="M6 6h2v12H6zM20 6L10 12l10 6V6z" /></svg>; }
+function NextIcon() { return <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><path d="M16 6h2v12h-2zM4 6l10 6L4 18V6z" /></svg>; }
 
 function SpotifySave({ spotify, onSave, total }) {
   const GREEN = "#1DB954";
