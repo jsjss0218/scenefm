@@ -282,6 +282,7 @@ export default function SceneFM() {
   const [mode, setMode] = useState("photo"); // photo | video
   const [recording, setRecording] = useState(false);
   const [shot, setShot] = useState(null);
+  const [pendingFrames, setPendingFrames] = useState(null);
   const [result, setResult] = useState(null);
   const [error, setError] = useState("");
   const [liveCam, setLiveCam] = useState(false);
@@ -453,36 +454,45 @@ export default function SceneFM() {
 
   useEffect(() => () => { playerRef.current?.disconnect(); }, []);
 
+  const stagePreview = useCallback((frames) => {
+    const list = Array.isArray(frames) ? frames : [frames];
+    setPendingFrames(list); setShot(list[0]);
+    if (streamRef.current) { streamRef.current.getTracks().forEach((t) => t.stop()); streamRef.current = null; }
+    setLiveCam(false); setRecording(false);
+    setStage("preview");
+  }, []);
+
   const onShutter = async () => {
     if (mode === "video") {
       if (liveCam && videoRef.current && videoRef.current.videoWidth) {
         setRecording(true);
         const frames = await captureLiveFrames(videoRef.current, 3, 600);
-        analyze(frames);
+        stagePreview(frames);
       } else { videoFileRef.current?.click(); }
       return;
     }
-    if (liveCam && videoRef.current && videoRef.current.videoWidth) analyze([videoFrameToJpeg(videoRef.current)]);
+    if (liveCam && videoRef.current && videoRef.current.videoWidth) stagePreview([videoFrameToJpeg(videoRef.current)]);
     else fileRef.current?.click();
   };
   const onPick = async (e) => {
     const f = e.target.files?.[0]; if (!f) return;
-    try { analyze([await fileToScaledJpeg(f)]); } catch (err) { setError(err.message); setStage("error"); }
+    try { stagePreview([await fileToScaledJpeg(f)]); } catch (err) { setError(err.message); setStage("error"); }
     e.target.value = "";
   };
   const onPickVideo = async (e) => {
     const f = e.target.files?.[0]; if (!f) return;
-    setStage("analyzing");
-    try { analyze(await sampleVideoFile(f)); } catch (err) { setError(err.message); setStage("error"); }
+    try { stagePreview(await sampleVideoFile(f)); } catch (err) { setError(err.message); setStage("error"); }
     e.target.value = "";
   };
+  const confirmAnalyze = () => { if (pendingFrames) analyze(pendingFrames); };
   const adjustMood = (key) => { setBusyMood(key); analyze(shot, key); };
   const restart = () => {
     if (playerRef.current) { try { playerRef.current.pause(); } catch {} try { playerRef.current.disconnect(); } catch {} playerRef.current = null; }
     setPlayer({ status: "idle", deviceId: "", uris: [], index: 0, isPlaying: false, track: null, progressMs: 0, durationMs: 0, error: "", premiumRequired: false });
     setResult(null); setShot(null); setError(""); setStage("capture"); setRecording(false); setSpotify({ status: "idle", progress: "", url: "", matched: 0, total: 0, error: "" });
   };
-  const goCapture = () => { setError(""); setStage("capture"); };
+  const goCapture = (m) => { if (m) setMode(m); setError(""); setStage("capture"); };
+  const connectSpotify = async () => { try { await ensureSpotify(); } catch {} };
 
   if (isAuthCallback) {
     return (
@@ -500,10 +510,11 @@ export default function SceneFM() {
       <input ref={fileRef} type="file" accept="image/*" capture="environment" onChange={onPick} style={{ display: "none" }} />
       <input ref={videoFileRef} type="file" accept="video/*" capture="environment" onChange={onPickVideo} style={{ display: "none" }} />
       <div style={{ maxWidth: 480, margin: "0 auto", minHeight: "100%", position: "relative" }}>
-        {stage === "home" && <HomeView onStart={goCapture} />}
+        {stage === "home" && <HomeView onPhoto={() => goCapture("photo")} onVideo={() => goCapture("video")} onSpotify={connectSpotify} />}
         {stage === "capture" && <CaptureView liveCam={liveCam} videoRef={videoRef} onShutter={onShutter}
           onUpload={() => (mode === "video" ? videoFileRef : fileRef).current?.click()}
           mode={mode} setMode={setMode} recording={recording} />}
+        {stage === "preview" && <PreviewView shot={shot} frames={pendingFrames} accent={accent} onRetake={() => goCapture()} onConfirm={confirmAnalyze} />}
         {stage === "analyzing" && <AnalyzingView shot={shot} accent={accent} />}
         {stage === "error" && <ErrorView msg={error} onRetry={restart} />}
         {stage === "station" && result && (
@@ -526,19 +537,51 @@ function Wordmark({ freq = "88.3", accent = "#FF8C42" }) {
   );
 }
 
-function HomeView({ onStart }) {
+function HomeView({ onPhoto, onVideo, onSpotify }) {
   return (
-    <div style={{ height: "100dvh", minHeight: 560, display: "flex", flexDirection: "column", justifyContent: "center", alignItems: "center", padding: 28, textAlign: "center", position: "relative" }}>
-      <div style={{ position: "absolute", inset: 0, background: "radial-gradient(90% 60% at 50% 25%, #1c2536 0%, #0a0c12 75%)" }} />
+    <div style={{ minHeight: "100dvh", display: "flex", flexDirection: "column", justifyContent: "center", padding: "28px 26px", position: "relative" }}>
+      <div style={{ position: "absolute", inset: 0, background: "radial-gradient(90% 55% at 50% 22%, #1c2536 0%, #0a0c12 75%)" }} />
       <div style={{ position: "relative" }} className="sfm-rise">
-        <div className="sfm-mono" style={{ fontSize: 12, color: "#FF8C42", letterSpacing: ".2em", marginBottom: 10 }}>◉ 88.3 MHz</div>
-        <h1 className="sfm-display" style={{ fontSize: 72, margin: "0 0 2px", lineHeight: .9 }}>SCENE&nbsp;FM</h1>
-        <p style={{ fontSize: 15, color: "#cfd3dd", margin: "10px 0 4px" }}>지금 이 순간을, 플레이리스트로.</p>
-        <p style={{ fontSize: 13, color: "#8b92a3", margin: "0 0 36px", lineHeight: 1.6 }}>
-          장면을 찍으면 AI가 장소·빛·색감·속도감을 읽고<br />그 순간에 어울리는 방송국을 만들어 드려요.
+        <div className="sfm-mono" style={{ fontSize: 12, color: "#FF8C42", letterSpacing: ".2em", marginBottom: 10 }}>◉ 88.3 MHz · SCENE FM</div>
+        <h1 className="sfm-display" style={{ fontSize: 46, margin: "0 0 14px", lineHeight: .98 }}>지금 보는 장면을<br />플레이리스트로.</h1>
+        <p style={{ fontSize: 14, color: "#aab0bd", margin: "0 0 34px", lineHeight: 1.6 }}>
+          사진이나 짧은 영상을 찍으면 AI가 장소·빛·색감·속도감·분위기를 분석해<br />지금 이 순간에 어울리는 음악을 만들어줍니다.
         </p>
-        <button onClick={onStart} style={{ ...solidBtn, background: "#F4F1E8", color: "#0a0c12", padding: "15px 44px", fontSize: 16 }}>
-          시작하기
+        <button onClick={onPhoto} style={{ ...solidBtn, width: "100%", boxSizing: "border-box", background: "#F4F1E8", color: "#0a0c12", display: "flex", alignItems: "center", justifyContent: "center", gap: 9, marginBottom: 10 }}>
+          <CameraIcon /> 사진 찍기
+        </button>
+        <button onClick={onVideo} style={{ ...solidBtn, width: "100%", boxSizing: "border-box", background: "rgba(244,241,232,.1)", color: "#F4F1E8", border: "1px solid rgba(244,241,232,.2)", display: "flex", alignItems: "center", justifyContent: "center", gap: 9, marginBottom: 10 }}>
+          <VideoIcon /> 짧은 영상 찍기
+        </button>
+        <button onClick={onSpotify} style={{ ...solidBtn, width: "100%", boxSizing: "border-box", background: "#1DB954", color: "#fff", display: "flex", alignItems: "center", justifyContent: "center", gap: 9 }}>
+          <SpotifyIcon color="#fff" /> Spotify 연결하기
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function PreviewView({ shot, frames, accent, onRetake, onConfirm }) {
+  const isVideo = Array.isArray(frames) && frames.length > 1;
+  return (
+    <div style={{ minHeight: "100dvh", display: "flex", flexDirection: "column", padding: "20px 22px 28px" }}>
+      <div className="sfm-rise" style={{ marginBottom: 14 }}><Wordmark accent={accent} /></div>
+      <div className="sfm-rise" style={{ position: "relative", flex: 1, minHeight: 0, borderRadius: 18, overflow: "hidden", background: "#0f1320", border: "1px solid rgba(244,241,232,.1)" }}>
+        {shot && <img src={shot} alt="" style={{ width: "100%", height: "100%", objectFit: "cover" }} />}
+        {isVideo && (
+          <div style={{ position: "absolute", left: 12, right: 12, bottom: 12, display: "flex", gap: 6 }}>
+            {frames.map((f, i) => <img key={i} src={f} alt="" style={{ flex: 1, height: 44, objectFit: "cover", borderRadius: 6, border: "1px solid rgba(244,241,232,.25)" }} />)}
+          </div>
+        )}
+        <div style={{ position: "absolute", top: 12, left: 12, padding: "4px 10px", borderRadius: 999, background: "rgba(10,12,18,.7)", border: "1px solid rgba(244,241,232,.2)" }}>
+          <span className="sfm-mono" style={{ fontSize: 11, color: "#cfd3dd" }}>{isVideo ? "영상 · 대표 프레임 3장" : "사진"}</span>
+        </div>
+      </div>
+      <p style={{ textAlign: "center", fontSize: 13, color: "#8b92a3", margin: "16px 0 14px" }}>이 장면으로 플레이리스트를 만들까요?</p>
+      <div className="sfm-rise" style={{ display: "flex", gap: 10 }}>
+        <button onClick={onRetake} style={{ ...solidBtn, flex: 1, background: "rgba(244,241,232,.1)", color: "#F4F1E8", border: "1px solid rgba(244,241,232,.2)" }}>다시 찍기</button>
+        <button onClick={onConfirm} style={{ ...solidBtn, flex: 2, background: accent, color: "#0a0c12", display: "flex", alignItems: "center", justifyContent: "center", gap: 8 }}>
+          <PlayIcon /> 이 장면으로 분석하기
         </button>
       </div>
     </div>
@@ -888,5 +931,6 @@ function EnergyCurve({ accent, accent2, groups }) {
 }
 function PlayIcon({ small }) { const s = small ? 14 : 16; return <svg width={s} height={s} viewBox="0 0 24 24" fill="currentColor"><path d="M8 5v14l11-7z" /></svg>; }
 function CameraIcon() { return <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7"><path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z" /><circle cx="12" cy="13" r="4" /></svg>; }
+function VideoIcon() { return <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7"><rect x="2" y="6" width="14" height="12" rx="2" /><path d="M22 8l-6 4 6 4V8z" /></svg>; }
 const solidBtn = { padding: "13px 20px", borderRadius: 13, border: "none", fontSize: 15, fontWeight: 700, cursor: "pointer" };
 const ghostWide = { width: "100%", boxSizing: "border-box", padding: "12px", borderRadius: 12, marginTop: 8, border: "1px solid rgba(244,241,232,.18)", background: "rgba(20,24,34,.5)", color: "#cfd3dd", fontSize: 14, fontWeight: 600, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", gap: 8 };
