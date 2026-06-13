@@ -616,7 +616,6 @@ export default function SceneFM() {
   const openInSpotify = useCallback(() => {
     const first = (result && result.tracks && result.tracks[0]) || null;
     const url = spotify.url
-      || (result?.station ? `https://open.spotify.com/search/${enc(result.station)}` : null)
       || (first ? spotifySearch(first.t, first.a) : "https://open.spotify.com");
     window.open(url, "_blank", "noopener");
   }, [spotify.url, result]);
