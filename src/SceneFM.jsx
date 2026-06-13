@@ -253,6 +253,7 @@ function requireSpotifyScopes(scope, required, purpose) {
   );
 }
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+let spotifyRateLimitUntil = 0;
 function assertSpotifyPlaybackEnvironment() {
   const host = window.location.hostname;
   const isLocal = host === "localhost" || host === "127.0.0.1" || host === "::1";
@@ -277,14 +278,21 @@ async function spErr(res, path) {
   return `Spotify ${res.status}${detail ? `: ${detail}` : ` (${path})`}${hint}`;
 }
 async function spFetch(token, path, options = {}, attempt = 0) {
+  if (Date.now() < spotifyRateLimitUntil) {
+    const waitSec = Math.ceil((spotifyRateLimitUntil - Date.now()) / 1000);
+    throw new Error(`Spotify 429: 요청 제한 중이에요. ${waitSec}초 뒤 다시 시도해 주세요.`);
+  }
   const res = await fetch("https://api.spotify.com/v1" + path, {
     ...options,
     headers: { Authorization: "Bearer " + token, ...(options.headers || {}) },
   });
-  if (res.status === 429 && attempt < 3) {
-    const retryAfter = Number(res.headers.get("Retry-After") || 1);
-    await sleep(Math.min(8000, Math.max(1000, retryAfter * 1000)) + attempt * 500);
-    return spFetch(token, path, options, attempt + 1);
+  if (res.status === 429) {
+    const retryAfter = Number(res.headers.get("Retry-After") || 60);
+    spotifyRateLimitUntil = Date.now() + Math.min(120000, Math.max(10000, retryAfter * 1000));
+    if (attempt < 1) {
+      await sleep(Math.min(120000, Math.max(10000, retryAfter * 1000)));
+      return spFetch(token, path, options, attempt + 1);
+    }
   }
   return res;
 }
@@ -389,8 +397,8 @@ async function searchTrackUri(token, t, a, cache) {
   const cacheKey = `${normSearchText(title)}::${normSearchText(artist)}`;
   if (cache?.has(cacheKey)) return cache.get(cacheKey);
   const candidates = [
-    title && artist ? `track:${title} artist:${artist}` : "",
     title && artist ? `${title} ${artist}` : "",
+    title && artist ? `track:${title} artist:${artist}` : "",
     title || "",
   ].filter(Boolean);
   const seenQueries = new Set();
@@ -641,13 +649,10 @@ export default function SceneFM() {
       try { sdkPlayer.activateElement && sdkPlayer.activateElement(); } catch {}
 
       setPlayer((p) => ({ ...p, status: "resolving" }));
-      let uris = await resolveQueueUris(access, tracks, null, 8);
+      const playbackTracks = startTrack ? [startTrack, ...tracks.filter((t) => t !== startTrack)] : tracks;
+      let uris = await resolveQueueUris(access, playbackTracks, null, 1);
       if (!uris.length) throw new Error("추천된 곡명을 Spotify 검색으로 찾지 못했어요. 곡명/아티스트 표기를 바꿔 다시 분석해 보세요.");
       if (doShuffle) uris = shuffleArr(uris);
-      if (startTrack) {
-        const u = await searchTrackUri(access, startTrack.t, startTrack.a, new Map());
-        if (u) uris = [u, ...uris.filter((x) => x !== u)];
-      }
       urisRef.current = uris;
 
       setPlayer((p) => ({ ...p, status: "ready", uris, index: 0 }));
