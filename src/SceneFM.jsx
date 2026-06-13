@@ -225,9 +225,21 @@ async function spotifyAuthorize() {
   if (!res.ok) throw new Error("Spotify 토큰 발급에 실패했어요.");
   return (await res.json()).access_token;
 }
+// 실패 응답의 본문까지 읽어 실제 원인(403/401/400…)을 메시지에 담는다
+async function spErr(res, path) {
+  let detail = "";
+  try { const j = await res.json(); detail = j?.error?.message || (j?.error ? JSON.stringify(j.error) : ""); }
+  catch { try { detail = await res.text(); } catch {} }
+  const hint =
+    res.status === 403 ? " — 개발 모드 앱이면 Dashboard → User Management에 이 Spotify 계정이 추가됐는지 확인하세요. (재생은 Premium 필요)"
+    : res.status === 401 ? " — 토큰이 만료됐어요. 다시 로그인해 주세요."
+    : res.status === 404 ? " — 활성 디바이스를 찾지 못했어요."
+    : "";
+  return `Spotify ${res.status}${detail ? `: ${detail}` : ` (${path})`}${hint}`;
+}
 async function spGet(token, path) {
   const res = await fetch("https://api.spotify.com/v1" + path, { headers: { Authorization: "Bearer " + token } });
-  if (!res.ok) throw new Error("Spotify 요청 실패 (" + res.status + ")");
+  if (!res.ok) throw new Error(await spErr(res, path));
   return res.json();
 }
 async function spPost(token, path, body) {
@@ -235,7 +247,7 @@ async function spPost(token, path, body) {
     method: "POST", headers: { Authorization: "Bearer " + token, "Content-Type": "application/json" },
     body: JSON.stringify(body),
   });
-  if (!res.ok) throw new Error("Spotify 요청 실패 (" + res.status + ")");
+  if (!res.ok) throw new Error(await spErr(res, path));
   return res.json();
 }
 async function spPut(token, path, body) {
@@ -243,8 +255,20 @@ async function spPut(token, path, body) {
     method: "PUT", headers: { Authorization: "Bearer " + token, "Content-Type": "application/json" },
     body: body ? JSON.stringify(body) : undefined,
   });
-  if (!res.ok && res.status !== 204) throw new Error("Spotify 요청 실패 (" + res.status + ")");
+  if (!res.ok && res.status !== 204) throw new Error(await spErr(res, path));
   return res.status === 204 ? null : res.json().catch(() => null);
+}
+// 지정한 디바이스에서 '이 큐(uris)만' 재생. 디바이스가 아직 미등록(404)이면 잠깐 뒤 재시도.
+async function startPlayback(token, deviceId, uris, attempt = 0) {
+  try {
+    await spPut(token, `/me/player/play?device_id=${deviceId}`, { uris });
+  } catch (e) {
+    if (attempt < 2 && /\b404\b/.test(e.message)) {
+      await new Promise((r) => setTimeout(r, 600));
+      return startPlayback(token, deviceId, uris, attempt + 1);
+    }
+    throw e;
+  }
 }
 // Web Playback SDK 스크립트를 1회만 로드
 let sdkPromise = null;
@@ -430,18 +454,28 @@ export default function SceneFM() {
             index: Math.max(0, uris.indexOf(cur?.uri)) ,
           }));
         });
-        sdkPlayer.addListener("ready", ({ device_id }) => {
+        sdkPlayer.addListener("ready", async ({ device_id }) => {
           playerRef.current = sdkPlayer;
           setPlayer((p) => ({ ...p, status: "ready", deviceId: device_id, uris, index: 0 }));
-          spPut(tokenRef.current.access, "/me/player", { device_ids: [device_id], play: false }).catch(() => {});
-          spPut(tokenRef.current.access, `/me/player/play?device_id=${device_id}`, { uris }).catch((e) =>
-            setPlayer((p) => ({ ...p, error: e.message })));
+          try {
+            // 디바이스가 Spotify 백엔드에 완전히 등록될 시간을 준다
+            await new Promise((r) => setTimeout(r, 700));
+            // device_id 쿼리만으로 '이 디바이스 활성화 + 지정 큐 재생'이 함께 처리된다.
+            // 별도 transfer(/me/player) 호출은 기존 재생 컨텍스트를 상속시켜
+            // '틀던 곡이 그대로 나오는' 원인이 되므로 제거.
+            await startPlayback(tokenRef.current.access, device_id, uris);
+          } catch (e) {
+            setPlayer((p) => ({ ...p, error: e.message }));
+          }
         });
         await sdkPlayer.connect();
       } else {
         setPlayer((p) => ({ ...p, status: "ready", uris, index: 0 }));
-        spPut(tokenRef.current.access, `/me/player/play?device_id=${player.deviceId}`, { uris }).catch((e) =>
-          setPlayer((p) => ({ ...p, error: e.message })));
+        try {
+          await startPlayback(tokenRef.current.access, player.deviceId, uris);
+        } catch (e) {
+          setPlayer((p) => ({ ...p, error: e.message }));
+        }
       }
     } catch (e) {
       setPlayer((p) => ({ ...p, status: "error", error: e.message || "재생을 시작하지 못했어요." }));
