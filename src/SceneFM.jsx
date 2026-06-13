@@ -58,6 +58,7 @@ const MOODS = [
 const enc = (s) => encodeURIComponent(s);
 const ytmusic = (t, a) => `https://music.youtube.com/search?q=${enc(`${t} ${a}`)}`;
 const spotifySearch = (t, a) => `https://open.spotify.com/search/${enc(`${t} ${a}`)}`;
+const ENABLE_SPOTIFY_SEARCH_API = false; // 429 방지: 기본값은 Spotify Search API 호출 금지
 // Fisher–Yates 셔플 (원본 배열 보존)
 function shuffleArr(arr) {
   const a = arr.slice();
@@ -374,6 +375,15 @@ function primaryArtist(s) {
 function normSearchText(s) {
   return cleanTrackText(s).toLowerCase().replace(/[\s'"’‘“”.,:;!?()[\]{}\-–—_/\\]+/g, "");
 }
+function trackSpotifyUri(track) {
+  const uri = track?.uri || track?.spotify_uri || track?.spotifyUri || track?.spotify?.uri;
+  if (typeof uri === "string" && uri.startsWith("spotify:track:")) return uri;
+  const id = track?.spotify_id || track?.spotifyId || track?.spotify?.id;
+  if (typeof id === "string" && /^[A-Za-z0-9]{22}$/.test(id)) return `spotify:track:${id}`;
+  const url = track?.spotify_url || track?.spotifyUrl || track?.spotify?.url;
+  const m = typeof url === "string" ? url.match(/open\.spotify\.com\/track\/([A-Za-z0-9]{22})/) : null;
+  return m ? `spotify:track:${m[1]}` : null;
+}
 function scoreSpotifyTrack(item, title, artist) {
   const wantedTitle = normSearchText(title);
   const wantedArtist = normSearchText(artist);
@@ -392,6 +402,7 @@ async function spotifyTrackSearch(token, q, limit = 10) {
   return d.tracks?.items || [];
 }
 async function searchTrackUri(token, t, a, cache) {
+  if (!ENABLE_SPOTIFY_SEARCH_API) return null;
   const title = cleanTrackText(t);
   const artist = primaryArtist(a);
   const cacheKey = `${normSearchText(title)}::${normSearchText(artist)}`;
@@ -531,7 +542,7 @@ export default function SceneFM() {
     const searchCache = new Map();
     for (const t of tracks) {
       if (done > 0) await sleep(180);
-      const uri = await searchTrackUri(access, t.t, t.a, searchCache);
+      const uri = trackSpotifyUri(t) || await searchTrackUri(access, t.t, t.a, searchCache);
       if (uri && !seen.has(uri)) { seen.add(uri); uris.push(uri); }
       done++;
       onProgress && onProgress(done, uris.length);
@@ -544,12 +555,12 @@ export default function SceneFM() {
     const tracks = (result && result.tracks) || [];
     if (!tracks.length) return;
     try {
-      setSpotify({ status: "connecting", progress: "Spotify 연결 중…", url: "", matched: 0, total: tracks.length, error: "" });
+      setSpotify({ status: "working", progress: "Spotify URI 확인 중…", url: "", matched: 0, total: tracks.length, error: "" });
+      const uris = await resolveQueueUris(null, tracks, (done, matched) =>
+        setSpotify((s) => ({ ...s, progress: `Spotify URI 확인 중 ${done}/${tracks.length}`, matched })));
+      if (!uris.length) throw new Error("429 방지를 위해 Spotify 검색 API를 끈 상태예요. 추천 결과에 spotify:track URI가 있을 때만 플레이리스트를 만들 수 있어요.");
+      setSpotify((s) => ({ ...s, status: "connecting", progress: "Spotify 연결 중…" }));
       const { access, userId } = await ensureSpotify();
-      setSpotify((s) => ({ ...s, status: "working", progress: "곡을 찾는 중…" }));
-      const uris = await resolveQueueUris(access, tracks, (done, matched) =>
-        setSpotify((s) => ({ ...s, progress: `곡을 찾는 중 ${done}/${tracks.length}`, matched })));
-      if (!uris.length) throw new Error("추천된 곡명을 Spotify 검색으로 찾지 못했어요. 곡명/아티스트 표기를 바꿔 다시 분석해 보세요.");
       setSpotify((s) => ({ ...s, progress: `${uris.length}곡으로 플레이리스트 만드는 중…` }));
       const desc = (result.tagline ? result.tagline + " · " : "") + "Made by Scene FM";
       const pl = await spPost(access, `/users/${userId}/playlists`, {
@@ -644,14 +655,17 @@ export default function SceneFM() {
     try {
       setPlayer((p) => ({ ...p, status: "connecting", error: "", premiumRequired: false }));
       assertSpotifyPlaybackEnvironment();
+      const playbackTracks = startTrack ? [startTrack, ...tracks.filter((t) => t !== startTrack)] : tracks;
+      setPlayer((p) => ({ ...p, status: "resolving" }));
+      let uris = await resolveQueueUris(null, playbackTracks, null, 1);
+      if (!uris.length) {
+        const firstTrack = playbackTracks[0];
+        if (firstTrack) window.open(spotifySearch(firstTrack.t, firstTrack.a), "_blank", "noopener");
+        throw new Error("429 방지를 위해 Spotify 검색 API를 끈 상태예요. Spotify 검색 페이지를 열었어요.");
+      }
       const { access } = await ensureSpotify();
       const sdkPlayer = await ensureSdkPlayer();
       try { sdkPlayer.activateElement && sdkPlayer.activateElement(); } catch {}
-
-      setPlayer((p) => ({ ...p, status: "resolving" }));
-      const playbackTracks = startTrack ? [startTrack, ...tracks.filter((t) => t !== startTrack)] : tracks;
-      let uris = await resolveQueueUris(access, playbackTracks, null, 1);
-      if (!uris.length) throw new Error("추천된 곡명을 Spotify 검색으로 찾지 못했어요. 곡명/아티스트 표기를 바꿔 다시 분석해 보세요.");
       if (doShuffle) uris = shuffleArr(uris);
       urisRef.current = uris;
 
