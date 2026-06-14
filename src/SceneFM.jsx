@@ -425,7 +425,7 @@ function cachedTrackUri(track) {
   } catch {}
   return null;
 }
-async function resolveTracksOnServer(tracks, limit = Infinity) {
+async function resolveTracksOnServer(tracks, limit = Infinity, accessToken = "") {
   const target = Number.isFinite(limit) ? limit : tracks.length;
   const selected = tracks.slice(0, Number.isFinite(limit) ? Math.min(tracks.length, Math.max(target, 6)) : tracks.length);
   const localUris = [];
@@ -438,7 +438,10 @@ async function resolveTracksOnServer(tracks, limit = Infinity) {
   if (!unresolved.length) return localUris;
   const res = await fetch("/api/resolve-tracks", {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: {
+      "Content-Type": "application/json",
+      ...(accessToken ? { Authorization: `Bearer ${accessToken}` } : {}),
+    },
     body: JSON.stringify({ tracks: unresolved.map((track) => ({ t: track.t, a: track.a, y: track.y })), limit: target }),
   });
   if (!res.ok) {
@@ -446,8 +449,16 @@ async function resolveTracksOnServer(tracks, limit = Infinity) {
     try {
       const body = await res.json();
       detail = body?.error?.message || body?.error || "";
-    } catch {}
-    throw new Error(detail || "곡 매칭 서버에 연결하지 못했어요.");
+    } catch {
+      try { detail = await res.text(); } catch {}
+    }
+    const prefix = `/api/resolve-tracks ${res.status}`;
+    const hint =
+      res.status === 404 ? "배포에 api/resolve-tracks.js가 포함되지 않았어요."
+      : res.status === 405 ? "곡 매칭 API는 POST 요청만 지원해요."
+      : res.status >= 500 ? "곡 매칭 서버 내부 설정 또는 Spotify 서버 호출에 실패했어요."
+      : "곡 매칭 서버 요청에 실패했어요.";
+    throw new Error(`${prefix}: ${detail || hint}`);
   }
   const data = await res.json();
   const resolved = Array.isArray(data.results)
@@ -600,8 +611,8 @@ export default function SceneFM() {
     return tokenRef.current;
   }, []);
 
-  const resolveQueueUris = useCallback(async (tracks, onProgress, maxMatches = Infinity) => {
-    const rawUris = await resolveTracksOnServer(tracks, maxMatches);
+  const resolveQueueUris = useCallback(async (access, tracks, onProgress, maxMatches = Infinity) => {
+    const rawUris = await resolveTracksOnServer(tracks, maxMatches, access);
     const seen = new Set(); const uris = [];
     for (const uri of rawUris) {
       if (uri && !seen.has(uri)) { seen.add(uri); uris.push(uri); }
@@ -613,11 +624,11 @@ export default function SceneFM() {
 
   // 곡 URI를 가져온다 — 같은 트랙 목록이면 미리 찾아둔 캐시를 즉시 반환(네트워크 0).
   // 캐시가 없을 때만 실제로 검색한다.
-  const getUris = useCallback(async (tracks, maxMatches = 8) => {
+  const getUris = useCallback(async (tracks, maxMatches = 8, access = "") => {
     if (preparedRef.current.tracks === tracks && preparedRef.current.uris.length) {
       return preparedRef.current.uris.slice(0, maxMatches);
     }
-    const uris = await resolveQueueUris(tracks, null, maxMatches);
+    const uris = await resolveQueueUris(access, tracks, null, maxMatches);
     preparedRef.current = { tracks, uris };
     return uris;
   }, [resolveQueueUris]);
@@ -632,7 +643,7 @@ export default function SceneFM() {
       setSpotify({ status: "connecting", progress: "Spotify 연결 중…", url: "", matched: 0, total: tracks.length, error: "" });
       const { access, userId } = await ensureSpotify();
       setSpotify((s) => ({ ...s, status: "working", progress: "곡을 찾는 중…" }));
-      const uris = await resolveQueueUris(tracks, (done, matched) =>
+      const uris = await resolveQueueUris(access, tracks, (done, matched) =>
         setSpotify((s) => ({ ...s, progress: `곡을 찾는 중 ${done}/${Math.min(8, tracks.length)}`, matched })), 8);
       if (!uris.length) throw new Error("이 장면의 곡들이 Spotify에 없어 플레이리스트를 만들지 못했어요.");
       setSpotify((s) => ({ ...s, progress: `${uris.length}곡으로 플레이리스트 만드는 중…` }));
@@ -738,7 +749,7 @@ export default function SceneFM() {
 
       setPlayer((p) => ({ ...p, status: "resolving" }));
       const playbackTracks = startTrack ? [startTrack, ...tracks.filter((t) => t !== startTrack)] : (doShuffle ? shuffleArr(tracks) : tracks);
-      let uris = await getUris(playbackTracks, 1); // 429 방지: 우선 1곡만 찾아 바로 재생
+      let uris = await getUris(playbackTracks, 1, tokenRef.current.access); // 429 방지: 우선 1곡만 찾아 바로 재생
       if (!uris.length) throw new Error("이 장면의 곡들이 Spotify에 없어 재생할 수 없어요.");
       urisRef.current = uris;
       setPlayer((p) => ({ ...p, status: "ready", uris, index: 0 }));
@@ -771,7 +782,7 @@ export default function SceneFM() {
     if (stage === "station" && tokenRef.current.access) {
       warmPlayer();
       const tracks = resultRef.current && resultRef.current.tracks;
-      if (tracks) getUris(tracks).catch(() => {});
+      if (tracks) getUris(tracks, 8, tokenRef.current.access).catch(() => {});
     }
   }, [stage, warmPlayer, getUris]);
 
@@ -896,7 +907,7 @@ export default function SceneFM() {
       await ensureSpotify();
       warmPlayer(); // 플레이어 미리 연결 → 첫 재생 탭이 즉시 작동
       const tracks = resultRef.current && resultRef.current.tracks;
-      if (tracks) getUris(tracks).catch(() => {}); // URI도 미리 캐시
+      if (tracks) getUris(tracks, 8, tokenRef.current.access).catch(() => {}); // URI도 미리 캐시
     } catch {}
   };
 
