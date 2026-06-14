@@ -10,15 +10,7 @@ import React, { useEffect, useRef, useState, useCallback } from "react";
 const SPOTIFY_CLIENT_ID = "e51bc8c11879482a80216d21f42565cd"; // developer.spotify.com 에서 발급
 const SPOTIFY_REDIRECT_URI =
   typeof window !== "undefined" ? window.location.origin + window.location.pathname : "";
-const SPOTIFY_SCOPES = [
-  "playlist-modify-private",
-  "playlist-modify-public",
-  "streaming",
-  "user-read-email",
-  "user-read-private",
-  "user-read-playback-state",
-  "user-modify-playback-state",
-].join(" ");
+const SPOTIFY_SCOPES = "playlist-modify-private playlist-modify-public streaming user-read-email user-read-private";
 // ▲▲▲ 이 앱이 등록된 Redirect URI 와 SPOTIFY_REDIRECT_URI 가 정확히 일치해야 합니다 ▲▲▲
 
 const FONT_CSS = `
@@ -58,7 +50,6 @@ const MOODS = [
 const enc = (s) => encodeURIComponent(s);
 const ytmusic = (t, a) => `https://music.youtube.com/search?q=${enc(`${t} ${a}`)}`;
 const spotifySearch = (t, a) => `https://open.spotify.com/search/${enc(`${t} ${a}`)}`;
-const ENABLE_SPOTIFY_SEARCH_API = true; // 앱 자체 재생을 위해 Spotify track URI 검색 사용
 // Fisher–Yates 셔플 (원본 배열 보존)
 function shuffleArr(arr) {
   const a = arr.slice();
@@ -67,6 +58,45 @@ function shuffleArr(arr) {
     [a[i], a[j]] = [a[j], a[i]];
   }
   return a;
+}
+
+// ── 시간대 / 날씨 / 위치 (2차: 추천 컨텍스트) ──
+// 로컬 시간 → 아침·낮·노을·밤·새벽
+function computeTimeOfDay(d = new Date()) {
+  const h = d.getHours();
+  if (h >= 5 && h < 10) return "아침";
+  if (h >= 10 && h < 16) return "낮";
+  if (h >= 16 && h < 19) return "노을";
+  if (h >= 19 || h < 3) return "밤";
+  return "새벽"; // 3–5시
+}
+// Open-Meteo WMO weather_code → 한국어 날씨 (맑음/흐림/비/눈/안개)
+function mapWeatherCode(code) {
+  if (code == null) return "";
+  if (code === 0) return "맑음";
+  if ([1, 2, 3].includes(code)) return "흐림";
+  if ([45, 48].includes(code)) return "안개";
+  if ([51, 53, 55, 56, 57, 61, 63, 65, 66, 67, 80, 81, 82, 95, 96, 99].includes(code)) return "비";
+  if ([71, 73, 75, 77, 85, 86].includes(code)) return "눈";
+  return "흐림";
+}
+// 위/경도로 대략적 지역명 + 현재 날씨 조회 (둘 다 API 키 불필요, 실패해도 무시)
+// 날씨 연동이 어려운 환경을 대비해 mock 으로 쉽게 교체할 수 있도록 분리해 둔 함수.
+async function fetchAmbient(lat, lon) {
+  let place = "", weather = "";
+  try {
+    const r = await fetch(`https://api.bigdatacloud.net/data/reverse-geocode-client?latitude=${lat}&longitude=${lon}&localityLanguage=ko`);
+    if (r.ok) { const j = await r.json(); place = j.city || j.locality || j.principalSubdivision || ""; }
+  } catch {}
+  try {
+    const r = await fetch(`https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}&current=weather_code`);
+    if (r.ok) { const j = await r.json(); weather = mapWeatherCode(j.current && j.current.weather_code); }
+  } catch {}
+  return { place, weather };
+}
+// 추천 컨텍스트 → "서울 · 밤 · 비" 형태의 짧은 라벨 (정확한 위치는 과노출하지 않음)
+function ambientLabel(place, weather) {
+  return [place, computeTimeOfDay(), weather].filter(Boolean).join(" · ");
 }
 
 // ── image helpers ──
@@ -143,8 +173,9 @@ function extractJson(text) {
 }
 
 // ── Anthropic vision call (claude.ai 아티팩트 프록시 사용; 배포 시 백엔드 프록시 필요 — SETUP.md) ──
-async function callSceneFM(frames, modifier) {
+async function callSceneFM(frames, modifier, context) {
   const list = Array.isArray(frames) ? frames : [frames];
+  const ctx = context || {};
   const imageBlocks = list.map((d) => ({
     type: "image", source: { type: "base64", media_type: "image/jpeg", data: d.split(",")[1] },
   }));
@@ -156,6 +187,11 @@ async function callSceneFM(frames, modifier) {
       : "") +
     "Read the photo for place, time of day, color, movement, weather, emotion and era, then translate them into genre, era, BPM, sound texture and a playlist with an energy arc. " +
     "Recommend REAL, well-known existing songs that genuinely fit the scene. " +
+    "Ambient context (time of day, approximate place, weather) may be provided. The photo is always primary; use ambient context only as soft secondary guidance to tune genre and energy. " +
+    "Rough genre hints — 아침→Acoustic Pop/Indie Folk/Bossa Nova; 노을→City Pop/AOR/Soft Rock; 밤→Synthwave/R&B/Trip-hop; 새벽→Ambient/Lo-fi/Dream Pop; 비→Alternative R&B/Trip-hop/Synthwave; 맑음→Indie Pop/Funk Pop/Surf Rock; 흐림→Folk/Dream Pop/Soft Rock; 안개→Ambient/Neo Classical/Lo-fi. " +
+    (modifier
+      ? "A mood adjustment is requested. KEEP the same scene reading and station identity provided below (do not re-interpret the scene); only re-select music (genres, bpm, energy, vocal) and the track list to reflect the adjustment. "
+      : "") +
     "Reply with ONLY minified JSON — no code fences, no commentary. " +
     "Scene and music label values must be in Korean; track titles and artists stay in their original language. " +
     'Schema: {"station":string (an evocative FM station name e.g. "Sunset Road FM"),' +
@@ -165,7 +201,16 @@ async function callSceneFM(frames, modifier) {
     '"music":{"genres":[2-4 strings],"era":string,"bpm":string,"energy":string Korean,"vocal":string Korean},' +
     '"tracks":[16-18 objects {"t":title,"a":artist,"y":year,"s":section}]}. ' +
     "Sections: 1=entry(2-3 songs),2=main mood(5-6),3=energy lift(3-4),4=emotion hold(3-4),5=close(2). Order tracks by section ascending.";
-  const userText = "이 장면을 Scene FM 방송국으로 만들어줘." + (modifier ? ` 무드 조정 요청: ${modifier}.` : "");
+  const ambientBits = [];
+  if (ctx.timeOfDay) ambientBits.push(`현재 시간대: ${ctx.timeOfDay}`);
+  if (ctx.place) ambientBits.push(`대략적 위치: ${ctx.place}`);
+  if (ctx.weather) ambientBits.push(`현재 날씨: ${ctx.weather}`);
+  let userText = "이 장면을 Scene FM 방송국으로 만들어줘.";
+  if (ambientBits.length) userText += " 참고 정보 — " + ambientBits.join(", ") + ".";
+  if (modifier) userText += ` 무드 조정 요청: ${modifier}.`;
+  if (modifier && ctx.priorScene) {
+    userText += " 유지할 이전 분석: " + JSON.stringify({ scene: ctx.priorScene, station: ctx.priorStation, tagline: ctx.priorTagline });
+  }
   // 배포 환경: /api/scene 서버리스 프록시를 통해 호출 (API 키는 서버에만 보관)
   const res = await fetch("/api/scene", {
     method: "POST",
@@ -245,26 +290,6 @@ async function spotifyAuthorize() {
   const json = await res.json();
   return { access: json.access_token, scope: json.scope || "" };
 }
-function requireSpotifyScopes(scope, required, purpose) {
-  const granted = new Set(String(scope || "").split(/\s+/).filter(Boolean));
-  const missing = required.filter((s) => !granted.has(s));
-  if (!missing.length) return;
-  throw new Error(
-    `${purpose} 권한이 부족해요. spotify.com/account/apps 에서 'Scene FM' 접근을 제거(REVOKE)한 뒤 다시 로그인하세요. (부족한 권한: ${missing.join(", ")})`
-  );
-}
-const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-let spotifyRateLimitUntil = 0;
-function assertSpotifyPlaybackEnvironment() {
-  const host = window.location.hostname;
-  const isLocal = host === "localhost" || host === "127.0.0.1" || host === "::1";
-  if (!window.isSecureContext && !isLocal) {
-    throw new Error("Spotify 앱 내 재생은 HTTPS 또는 localhost에서만 안정적으로 동작해요.");
-  }
-  if (!window.MediaSource && !window.ManagedMediaSource) {
-    throw new Error("이 브라우저는 Spotify Web Playback을 지원하지 않을 수 있어요. Chrome/Edge 데스크톱에서 다시 시도해 주세요.");
-  }
-}
 // 실패 응답의 본문까지 읽어 실제 원인(403/401/400…)을 메시지에 담는다
 async function spErr(res, path) {
   let detail = "";
@@ -274,62 +299,29 @@ async function spErr(res, path) {
     res.status === 403 ? " — 개발 모드 앱이면 Dashboard → User Management에 이 Spotify 계정이 추가됐는지 확인하세요. (재생은 Premium 필요)"
     : res.status === 401 ? " — 토큰이 만료됐어요. 다시 로그인해 주세요."
     : res.status === 404 ? " — 활성 디바이스를 찾지 못했어요."
-    : res.status === 429 ? " — Spotify 요청이 너무 많아요. 잠시 후 자동 재시도하거나 1분 뒤 다시 눌러주세요."
     : "";
   return `Spotify ${res.status}${detail ? `: ${detail}` : ` (${path})`}${hint}`;
 }
-async function spFetch(token, path, options = {}, attempt = 0) {
-  if (Date.now() < spotifyRateLimitUntil) {
-    const waitSec = Math.ceil((spotifyRateLimitUntil - Date.now()) / 1000);
-    throw new Error(`Spotify 429: 요청 제한 중이에요. ${waitSec}초 뒤 다시 시도해 주세요.`);
-  }
-  const res = await fetch("https://api.spotify.com/v1" + path, {
-    ...options,
-    headers: { Authorization: "Bearer " + token, ...(options.headers || {}) },
-  });
-  if (res.status === 429) {
-    const retryAfter = Number(res.headers.get("Retry-After") || 60);
-    spotifyRateLimitUntil = Date.now() + Math.min(120000, Math.max(10000, retryAfter * 1000));
-    if (attempt < 1) {
-      await sleep(Math.min(120000, Math.max(10000, retryAfter * 1000)));
-      return spFetch(token, path, options, attempt + 1);
-    }
-  }
-  return res;
-}
 async function spGet(token, path) {
-  const res = await spFetch(token, path);
+  const res = await fetch("https://api.spotify.com/v1" + path, { headers: { Authorization: "Bearer " + token } });
   if (!res.ok) throw new Error(await spErr(res, path));
   return res.json();
 }
 async function spPost(token, path, body) {
-  const res = await spFetch(token, path, {
-    method: "POST", headers: { "Content-Type": "application/json" },
+  const res = await fetch("https://api.spotify.com/v1" + path, {
+    method: "POST", headers: { Authorization: "Bearer " + token, "Content-Type": "application/json" },
     body: JSON.stringify(body),
   });
   if (!res.ok) throw new Error(await spErr(res, path));
   return res.json();
 }
 async function spPut(token, path, body) {
-  const res = await spFetch(token, path, {
-    method: "PUT", headers: { "Content-Type": "application/json" },
+  const res = await fetch("https://api.spotify.com/v1" + path, {
+    method: "PUT", headers: { Authorization: "Bearer " + token, "Content-Type": "application/json" },
     body: body ? JSON.stringify(body) : undefined,
   });
   if (!res.ok && res.status !== 204) throw new Error(await spErr(res, path));
   return res.status === 204 ? null : res.json().catch(() => null);
-}
-async function transferPlayback(token, deviceId, attempt = 0) {
-  if (!deviceId) throw new Error("재생할 디바이스를 찾지 못했어요. 다시 시도해 주세요.");
-  try {
-    await spPut(token, "/me/player", { device_ids: [deviceId], play: false });
-  } catch (e) {
-    const retriable = /\b(404|500|502|503|504)\b/.test(e.message);
-    if (attempt < 5 && retriable) {
-      await new Promise((r) => setTimeout(r, 500 + attempt * 450));
-      return transferPlayback(token, deviceId, attempt + 1);
-    }
-    throw e;
-  }
 }
 // 지정한 디바이스에서 '이 큐(uris)만' 재생. 디바이스가 아직 미등록(404)이거나
 // 일시적 서버 오류(5xx)면 점증 지연으로 재시도해 간헐적 재생 실패를 줄인다.
@@ -337,7 +329,7 @@ async function startPlayback(token, deviceId, uris, attempt = 0) {
   if (!deviceId) throw new Error("재생할 디바이스를 찾지 못했어요. 다시 시도해 주세요.");
   if (!uris || !uris.length) throw new Error("재생할 곡을 찾지 못했어요.");
   try {
-    await spPut(token, `/me/player/play?device_id=${encodeURIComponent(deviceId)}`, { uris });
+    await spPut(token, `/me/player/play?device_id=${deviceId}`, { uris });
   } catch (e) {
     const retriable = /\b(404|500|502|503|504)\b/.test(e.message);
     if (attempt < 5 && retriable) {
@@ -361,71 +353,15 @@ function loadSpotifySdk() {
   });
   return sdkPromise;
 }
-function cleanTrackText(s) {
-  return String(s || "")
-    .replace(/\s*[-–—]\s*(remaster(ed)?|live|mono|stereo|radio edit|single version).*$/i, "")
-    .replace(/\s*\((feat\.?|with|remaster(ed)?|live|mono|stereo|radio edit|single version)[^)]+\)/gi, "")
-    .replace(/\s*\[[^\]]+\]/g, "")
-    .replace(/\s+/g, " ")
-    .trim();
-}
-function primaryArtist(s) {
-  return cleanTrackText(String(s || "").split(/\s*(?:,|&|\+| x | X | feat\.?| featuring | with )\s*/i)[0]);
-}
-function normSearchText(s) {
-  return cleanTrackText(s).toLowerCase().replace(/[\s'"’‘“”.,:;!?()[\]{}\-–—_/\\]+/g, "");
-}
-function trackSpotifyUri(track) {
-  const uri = track?.uri || track?.spotify_uri || track?.spotifyUri || track?.spotify?.uri;
-  if (typeof uri === "string" && uri.startsWith("spotify:track:")) return uri;
-  const id = track?.spotify_id || track?.spotifyId || track?.spotify?.id;
-  if (typeof id === "string" && /^[A-Za-z0-9]{22}$/.test(id)) return `spotify:track:${id}`;
-  const url = track?.spotify_url || track?.spotifyUrl || track?.spotify?.url;
-  const m = typeof url === "string" ? url.match(/open\.spotify\.com\/track\/([A-Za-z0-9]{22})/) : null;
-  return m ? `spotify:track:${m[1]}` : null;
-}
-function scoreSpotifyTrack(item, title, artist) {
-  const wantedTitle = normSearchText(title);
-  const wantedArtist = normSearchText(artist);
-  const itemTitle = normSearchText(item?.name);
-  const itemArtists = normSearchText((item?.artists || []).map((x) => x.name).join(" "));
-  let score = 0;
-  if (itemTitle === wantedTitle) score += 6;
-  else if (itemTitle.includes(wantedTitle) || wantedTitle.includes(itemTitle)) score += 3;
-  if (wantedArtist && itemArtists.includes(wantedArtist)) score += 4;
-  if (item?.uri?.startsWith("spotify:track:")) score += 1;
-  return score;
-}
-async function spotifyTrackSearch(token, q, limit = 10) {
-  const params = new URLSearchParams({ type: "track", limit: String(limit), q });
-  const d = await spGet(token, "/search?" + params.toString());
-  return d.tracks?.items || [];
-}
-async function searchTrackUri(token, t, a, cache) {
-  if (!ENABLE_SPOTIFY_SEARCH_API) return null;
-  const title = cleanTrackText(t);
-  const artist = primaryArtist(a);
-  const cacheKey = `${normSearchText(title)}::${normSearchText(artist)}`;
-  if (cache?.has(cacheKey)) return cache.get(cacheKey);
-  const candidates = [
-    title && artist ? `${title} ${artist}` : "",
-    title && artist ? `track:${title} artist:${artist}` : "",
-    title || "",
-  ].filter(Boolean);
-  const seenQueries = new Set();
-  for (const q of candidates) {
-    if (seenQueries.has(q)) continue;
-    seenQueries.add(q);
-    const items = await spotifyTrackSearch(token, q);
-    const ranked = items
-      .filter((item) => typeof item.uri === "string" && item.uri.startsWith("spotify:track:"))
-      .map((item) => ({ item, score: scoreSpotifyTrack(item, title, artist) }))
-      .sort((x, y) => y.score - x.score);
-    if (ranked[0]?.score > 0) { cache?.set(cacheKey, ranked[0].item.uri); return ranked[0].item.uri; }
-    if (ranked[0]?.item?.uri) { cache?.set(cacheKey, ranked[0].item.uri); return ranked[0].item.uri; }
-  }
-  cache?.set(cacheKey, null);
-  return null;
+async function searchTrackUri(token, t, a) {
+  const tryQ = async (q) => {
+    try {
+      const d = await spGet(token, "/search?type=track&limit=5&q=" + enc(q));
+      const item = d.tracks && d.tracks.items && d.tracks.items[0];
+      return item && typeof item.uri === "string" && item.uri.startsWith("spotify:track:") ? item.uri : null;
+    } catch { return null; }
+  };
+  return (await tryQ(`track:${t} artist:${a}`)) || (await tryQ(`${t} ${a}`));
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -446,6 +382,7 @@ export default function SceneFM() {
   const [liveCam, setLiveCam] = useState(false);
   const [busyMood, setBusyMood] = useState("");
   const [shuffle, setShuffle] = useState(false); // 랜덤 재생 토글
+  const [ambient, setAmbient] = useState({ status: "off", place: "", weather: "" }); // off|locating|on|denied
   const [spotify, setSpotify] = useState({ status: "idle", progress: "", url: "", matched: 0, total: 0, error: "" });
   const videoRef = useRef(null);
   const streamRef = useRef(null);
@@ -456,6 +393,11 @@ export default function SceneFM() {
   const deviceIdRef = useRef("");    // 현재 활성 Spotify 디바이스 id
   const urisRef = useRef([]);        // 현재 재생 큐 (state_changed 인덱스 계산용)
   const playLockRef = useRef(false); // 재생 시작 중복 호출 방지 락
+  const preparedRef = useRef({ tracks: null, uris: [] }); // 미리 찾아둔 곡 URI 캐시
+  const warmingRef = useRef(false); // 사전 연결(warm) 중에는 오류를 UI에 노출하지 않음
+  const ambientRef = useRef(ambient); // analyze 안에서 최신 컨텍스트 읽기용
+  const resultRef = useRef(null);     // 무드 조정 시 이전 분석 결과 참조
+  useEffect(() => { ambientRef.current = ambient; }, [ambient]);
 
   const accent = result?.palette?.accent || "#E0662A";
   const accent2 = result?.palette?.accent2 || "#A6364B";
@@ -491,23 +433,45 @@ export default function SceneFM() {
     if (streamRef.current) { streamRef.current.getTracks().forEach((t) => t.stop()); streamRef.current = null; }
     setLiveCam(false); setRecording(false);
     setSpotify({ status: "idle", progress: "", url: "", matched: 0, total: 0, error: "" });
-    if (!modifier) {
-      // 새 장면: 이전 재생 큐를 비워 '이전 플레이리스트가 계속 재생' 방지 (디바이스/SDK 재사용)
-      try { playerRef.current?.pause(); } catch {}
-      urisRef.current = [];
-      setShuffle(false);
-      setPlayer((p) => ({ ...p, status: "idle", isPlaying: false, track: null, progressMs: 0, durationMs: 0, uris: [], index: 0, error: "", premiumRequired: false }));
-      setStage("analyzing");
-    }
+    // 새 장면이든 무드 재구성이든: 이전 재생 큐를 비워 '이전 플레이리스트가 계속 재생'되는 것을 방지
+    // (SDK/디바이스는 재사용). 재구성 후엔 '지금 이 플레이리스트 재생하기'로 새 큐를 틀게 된다.
+    try { playerRef.current?.pause(); } catch {}
+    urisRef.current = [];
+    setShuffle(false);
+    setPlayer((p) => ({ ...p, status: "idle", isPlaying: false, track: null, progressMs: 0, durationMs: 0, uris: [], index: 0, error: "", premiumRequired: false }));
+    if (!modifier) setStage("analyzing"); // 무드 재구성은 결과 화면 위 오버레이로 표시
     setError("");
     try {
-      const r = await callSceneFM(modifier ? list : list, modifier);
+      const amb = ambientRef.current || {};
+      const prior = modifier ? resultRef.current : null;
+      const r = await callSceneFM(list, modifier, {
+        timeOfDay: computeTimeOfDay(), place: amb.place, weather: amb.weather,
+        priorScene: prior && prior.scene, priorStation: prior && prior.station, priorTagline: prior && prior.tagline,
+      });
       setResult(r); setStage("station");
     } catch (e) {
       setError(e.message || "장면을 읽지 못했어요.");
       if (!modifier) setStage("error");
     } finally { setBusyMood(""); }
   }, []);
+
+  useEffect(() => { resultRef.current = result; }, [result]);
+
+  // 위치·날씨 반영 켜기 (사용자 동의 기반). 거부/실패해도 시간대만으로 정상 작동.
+  const enableAmbient = useCallback(() => {
+    if (ambient.status === "locating") return;
+    if (typeof navigator === "undefined" || !navigator.geolocation) { setAmbient((a) => ({ ...a, status: "denied" })); return; }
+    setAmbient((a) => ({ ...a, status: "locating" }));
+    navigator.geolocation.getCurrentPosition(
+      async (pos) => {
+        const { latitude, longitude } = pos.coords;
+        const { place, weather } = await fetchAmbient(latitude, longitude);
+        setAmbient({ status: "on", place, weather });
+      },
+      () => setAmbient((a) => ({ ...a, status: "denied" })),
+      { enableHighAccuracy: false, timeout: 8000, maximumAge: 600000 }
+    );
+  }, [ambient.status]);
 
   const [player, setPlayer] = useState({
     status: "idle", // idle | connecting | resolving | ready | error
@@ -519,37 +483,56 @@ export default function SceneFM() {
   const ensureSpotify = useCallback(async () => {
     if (!tokenRef.current.access) {
       const { access, scope } = await spotifyAuthorize();
-      // 오래된 동의가 남아 필요한 권한이 빠진 토큰이 발급되는 경우를 즉시 감지
-      requireSpotifyScopes(
-        scope,
-        ["playlist-modify-private", "streaming", "user-read-playback-state", "user-modify-playback-state"],
-        "Spotify 저장/재생"
-      );
+      // 오래된 동의가 남아 쓰기 권한이 빠진 토큰이 발급되는 경우를 즉시 감지
+      if (!/playlist-modify-(private|public)/.test(scope)) {
+        throw new Error(
+          "이 로그인에는 플레이리스트 생성 권한이 없습니다. spotify.com/account/apps 에서 'Scene FM' 접근을 제거(REVOKE)한 뒤 다시 로그인하세요. (부여된 권한: " + (scope || "없음") + ")"
+        );
+      }
       tokenRef.current.access = access;
       tokenRef.current.scope = scope;
       tokenRef.current.userId = (await spGet(access, "/me")).id;
     }
-    requireSpotifyScopes(
-      tokenRef.current.scope,
-      ["playlist-modify-private", "streaming", "user-read-playback-state", "user-modify-playback-state"],
-      "Spotify 저장/재생"
-    );
     return tokenRef.current;
   }, []);
 
-  const resolveQueueUris = useCallback(async (access, tracks, onProgress, maxMatches = Infinity) => {
+  const resolveQueueUris = useCallback(async (access, tracks, onProgress) => {
     const seen = new Set(); const uris = []; let done = 0;
-    const searchCache = new Map();
     for (const t of tracks) {
-      if (done > 0) await sleep(180);
-      const uri = trackSpotifyUri(t) || await searchTrackUri(access, t.t, t.a, searchCache);
+      const uri = await searchTrackUri(access, t.t, t.a);
       if (uri && !seen.has(uri)) { seen.add(uri); uris.push(uri); }
       done++;
       onProgress && onProgress(done, uris.length);
-      if (uris.length >= maxMatches) break;
     }
     return uris;
   }, []);
+
+  // 곡 URI를 가져온다 — 같은 트랙 목록이면 미리 찾아둔 캐시를 즉시 반환(네트워크 0).
+  // 캐시가 없을 때만 실제로 검색한다.
+  const getUris = useCallback(async (tracks) => {
+    if (preparedRef.current.tracks === tracks && preparedRef.current.uris.length) {
+      return preparedRef.current.uris;
+    }
+    const { access } = await ensureSpotify();
+    const uris = await resolveQueueUris(access, tracks);
+    preparedRef.current = { tracks, uris };
+    return uris;
+  }, [ensureSpotify, resolveQueueUris]);
+
+  // 결과가 뜨고 이미 로그인돼 있으면, 탭하기 전에 미리 URI를 찾아 캐시한다.
+  // → 재생 탭 시 검색 지연이 사라져 자동재생 정책에 걸리지 않는다.
+  useEffect(() => {
+    const tracks = result && result.tracks;
+    if (!tracks || !tracks.length || !tokenRef.current.access) return;
+    let cancelled = false;
+    (async () => {
+      try {
+        const uris = await resolveQueueUris(tokenRef.current.access, tracks);
+        if (!cancelled && uris.length) preparedRef.current = { tracks, uris };
+      } catch {}
+    })();
+    return () => { cancelled = true; };
+  }, [result, resolveQueueUris]);
 
   const saveToSpotify = useCallback(async () => {
     const tracks = (result && result.tracks) || [];
@@ -560,7 +543,7 @@ export default function SceneFM() {
       setSpotify((s) => ({ ...s, status: "working", progress: "곡을 찾는 중…" }));
       const uris = await resolveQueueUris(access, tracks, (done, matched) =>
         setSpotify((s) => ({ ...s, progress: `곡을 찾는 중 ${done}/${tracks.length}`, matched })));
-      if (!uris.length) throw new Error("추천곡을 Spotify에서 찾지 못했어요.");
+      if (!uris.length) throw new Error("이 장면의 곡들이 Spotify에 없어 플레이리스트를 만들지 못했어요.");
       setSpotify((s) => ({ ...s, progress: `${uris.length}곡으로 플레이리스트 만드는 중…` }));
       const desc = (result.tagline ? result.tagline + " · " : "") + "Made by Scene FM";
       const pl = await spPost(access, `/users/${userId}/playlists`, {
@@ -598,17 +581,18 @@ export default function SceneFM() {
       });
       let settled = false;
       const settle = (fn) => { if (!settled) { settled = true; fn(); } };
+      const showErr = (patch) => { if (!warmingRef.current) setPlayer((p) => ({ ...p, ...patch })); };
       sdkPlayer.addListener("initialization_error", ({ message }) => {
-        setPlayer((p) => ({ ...p, status: "error", error: message || "플레이어를 초기화하지 못했어요." }));
+        showErr({ status: "error", error: message || "플레이어를 초기화하지 못했어요." });
         settle(() => reject(new Error(message || "init")));
       });
       sdkPlayer.addListener("authentication_error", () => {
         tokenRef.current.access = null;
-        setPlayer((p) => ({ ...p, status: "error", error: "Spotify 인증이 만료됐어요. 다시 로그인해 주세요." }));
+        showErr({ status: "error", error: "Spotify 인증이 만료됐어요. 다시 로그인해 주세요." });
         settle(() => reject(new Error("auth")));
       });
       sdkPlayer.addListener("account_error", () => {
-        setPlayer((p) => ({ ...p, status: "error", error: "Spotify Premium 계정이 필요해요. (무료 계정은 앱 내 재생이 제한됩니다)", premiumRequired: true }));
+        showErr({ status: "error", error: "Spotify Premium 계정이 필요해요. (무료 계정은 앱 내 재생이 제한됩니다)", premiumRequired: true });
         settle(() => reject(new Error("account")));
       });
       sdkPlayer.addListener("playback_error", ({ message }) => setPlayer((p) => ({ ...p, error: message })));
@@ -636,56 +620,71 @@ export default function SceneFM() {
       // 브라우저 자동재생 정책: 사용자 클릭 컨텍스트에서 오디오 요소를 활성화
       try { sdkPlayer.activateElement && sdkPlayer.activateElement(); } catch {}
       sdkPlayer.connect().then((ok) => {
-        if (!ok) { setPlayer((p) => ({ ...p, status: "error", error: "Spotify 플레이어 연결에 실패했어요." })); settle(() => reject(new Error("connect"))); }
+        if (!ok) { showErr({ status: "error", error: "Spotify 플레이어 연결에 실패했어요." }); settle(() => reject(new Error("connect"))); }
       });
       // 준비가 지나치게 지연될 때만 실패 처리 (성공 후엔 settle 가드로 무시)
       setTimeout(() => settle(() => {
-        setPlayer((p) => ({ ...p, status: "error", error: "플레이어 준비 시간이 초과됐어요. 다시 시도해 주세요." }));
+        showErr({ status: "error", error: "플레이어 준비 시간이 초과됐어요. 다시 시도해 주세요." });
         reject(new Error("timeout"));
       }), 12000);
     });
   }, []);
 
-  // 앱 내 재생 시작: tracks 를 인자로 받아 항상 '새 큐'로 교체 재생한다.
-  // (이전 재생목록이 그대로 이어지는 문제 방지)
+  // 앱 내 재생 — 단순화된 경로:
+  //  1) 제스처 안에서 즉시 오디오 활성화  2) 로그인/플레이어 확보(보통 캐시)
+  //  3) 미리 찾아둔 URI 사용  4) 바로 재생.  (탭 경로에 느린 검색을 두지 않는다)
   const playCore = useCallback(async (tracks, { shuffle: doShuffle = false, startTrack = null } = {}) => {
     if (!tracks || !tracks.length) return;
-    if (playLockRef.current) return; // 중복 클릭/연타 방지
+    if (playLockRef.current) return; // 연타 방지
     playLockRef.current = true;
+    // 사용자 탭 제스처 안에서 가장 먼저 오디오를 깨운다 (자동재생 정책 우회의 핵심)
+    try { playerRef.current && playerRef.current.activateElement && playerRef.current.activateElement(); } catch {}
     try {
       setPlayer((p) => ({ ...p, status: "connecting", error: "", premiumRequired: false }));
-      assertSpotifyPlaybackEnvironment();
-      const { access } = await ensureSpotify();
-      const sdkPlayer = await ensureSdkPlayer();
+      await ensureSpotify();                       // 캐시된 토큰이면 즉시
+      const sdkPlayer = await ensureSdkPlayer();   // 캐시된 플레이어면 즉시
       try { sdkPlayer.activateElement && sdkPlayer.activateElement(); } catch {}
-      const playbackTracks = startTrack ? [startTrack, ...tracks.filter((t) => t !== startTrack)] : tracks;
-      setPlayer((p) => ({ ...p, status: "resolving" }));
-      let uris = await resolveQueueUris(access, playbackTracks, null, 1);
-      if (!uris.length) {
-        throw new Error("추천곡을 Spotify에서 찾지 못했어요.");
-      }
-      if (doShuffle) uris = shuffleArr(uris);
-      urisRef.current = uris;
 
+      setPlayer((p) => ({ ...p, status: "resolving" }));
+      let uris = await getUris(tracks);            // 미리 찾아둔 캐시면 즉시
+      if (!uris.length) throw new Error("이 장면의 곡들이 Spotify에 없어 재생할 수 없어요.");
+      if (doShuffle) uris = shuffleArr(uris);
+      if (startTrack) {
+        const u = await searchTrackUri(tokenRef.current.access, startTrack.t, startTrack.a);
+        if (u) uris = [u, ...uris.filter((x) => x !== u)];
+      }
+      urisRef.current = uris;
       setPlayer((p) => ({ ...p, status: "ready", uris, index: 0 }));
-      try { sdkPlayer.activateElement && sdkPlayer.activateElement(); } catch {}
-      // 디바이스가 Spotify 백엔드에 완전히 등록될 시간을 약간 준 뒤,
-      // 계정의 현재 재생 디바이스를 SDK 플레이어로 명시 전환한다.
-      await new Promise((r) => setTimeout(r, 350));
-      await transferPlayback(access, deviceIdRef.current);
-      await startPlayback(access, deviceIdRef.current, uris);
+      await startPlayback(tokenRef.current.access, deviceIdRef.current, uris);
     } catch (e) {
-      const msg = e.message || "재생을 시작하지 못했어요.";
-      setPlayer((p) => ({ ...p, status: "error", error: msg, premiumRequired: /premium|403|account/i.test(msg) }));
+      setPlayer((p) => ({ ...p, status: "error", error: e.message || "재생을 시작하지 못했어요." }));
     } finally {
       playLockRef.current = false;
     }
-  }, [ensureSpotify, resolveQueueUris, ensureSdkPlayer]);
+  }, [ensureSpotify, ensureSdkPlayer, getUris]);
 
   const togglePlay = useCallback(() => { playerRef.current?.togglePlay(); }, []);
   const nextTrack = useCallback(() => { playerRef.current?.nextTrack(); }, []);
   const prevTrack = useCallback(() => { playerRef.current?.previousTrack(); }, []);
   const seekTo = useCallback((ms) => { playerRef.current?.seek(ms); }, []);
+
+  // 사전 연결: 다음 재생 탭이 '제스처 안에서 즉시' 재생되도록 플레이어를 미리 띄워 둔다.
+  // warm 중 오류는 UI에 노출하지 않는다(아직 사용자가 재생을 누르지 않았으므로).
+  const warmPlayer = useCallback(() => {
+    if (playerRef.current && deviceIdRef.current) return;
+    if (!tokenRef.current.access) return;
+    warmingRef.current = true;
+    ensureSdkPlayer().catch(() => {}).finally(() => { warmingRef.current = false; });
+  }, [ensureSdkPlayer]);
+
+  // 결과 화면 진입 시 이미 로그인돼 있으면 플레이어와 URI를 미리 준비해 둔다
+  useEffect(() => {
+    if (stage === "station" && tokenRef.current.access) {
+      warmPlayer();
+      const tracks = resultRef.current && resultRef.current.tracks;
+      if (tracks) getUris(tracks).catch(() => {});
+    }
+  }, [stage, warmPlayer, getUris]);
 
   // 현재 플레이리스트 재생 (메인 CTA)
   const playInApp = useCallback(() => playCore((result && result.tracks) || [], { shuffle }), [playCore, result, shuffle]);
@@ -709,6 +708,7 @@ export default function SceneFM() {
   const openInSpotify = useCallback(() => {
     const first = (result && result.tracks && result.tracks[0]) || null;
     const url = spotify.url
+      || (result?.station ? `https://open.spotify.com/search/${enc(result.station)}` : null)
       || (first ? spotifySearch(first.t, first.a) : "https://open.spotify.com");
     window.open(url, "_blank", "noopener");
   }, [spotify.url, result]);
@@ -793,7 +793,7 @@ export default function SceneFM() {
     e.target.value = "";
   };
   const confirmAnalyze = () => { if (pendingFrames) analyze(pendingFrames); };
-  const adjustMood = (key) => { setBusyMood(key); analyze(shot, key); };
+  const adjustMood = (key) => { if (busyMood) return; setBusyMood(key); analyze(shot, key); };
   const restart = () => {
     cancelAnimationFrame(recRafRef.current);
     if (playerRef.current) { try { playerRef.current.pause(); } catch {} try { playerRef.current.disconnect(); } catch {} playerRef.current = null; }
@@ -802,7 +802,14 @@ export default function SceneFM() {
     setResult(null); setShot(null); setError(""); setShuffle(false); setStage("capture"); setRecording(false); setRecProgress(0); setSpotify({ status: "idle", progress: "", url: "", matched: 0, total: 0, error: "" });
   };
   const goCapture = (m) => { cancelAnimationFrame(recRafRef.current); if (m) setMode(m); setError(""); setRecording(false); setRecProgress(0); setStage("capture"); };
-  const connectSpotify = async () => { try { await ensureSpotify(); } catch {} };
+  const connectSpotify = async () => {
+    try {
+      await ensureSpotify();
+      warmPlayer(); // 플레이어 미리 연결 → 첫 재생 탭이 즉시 작동
+      const tracks = resultRef.current && resultRef.current.tracks;
+      if (tracks) getUris(tracks).catch(() => {}); // URI도 미리 캐시
+    } catch {}
+  };
 
   if (isAuthCallback) {
     return (
@@ -820,7 +827,7 @@ export default function SceneFM() {
       <input ref={fileRef} type="file" accept="image/*" capture="environment" onChange={onPick} style={{ display: "none" }} />
       <input ref={videoFileRef} type="file" accept="video/*" capture="environment" onChange={onPickVideo} style={{ display: "none" }} />
       <div style={{ maxWidth: 480, margin: "0 auto", minHeight: "100%", position: "relative" }}>
-        {stage === "home" && <HomeView onPhoto={() => goCapture("photo")} onVideo={() => goCapture("video")} onSpotify={connectSpotify} />}
+        {stage === "home" && <HomeView onPhoto={() => goCapture("photo")} onVideo={() => goCapture("video")} onSpotify={connectSpotify} ambient={ambient} onEnableAmbient={enableAmbient} />}
         {stage === "capture" && <CaptureView liveCam={liveCam} videoRef={videoRef} onShutter={onShutter}
           onUpload={() => (mode === "video" ? videoFileRef : fileRef).current?.click()}
           mode={mode} setMode={setMode} recording={recording} recProgress={recProgress} />}
@@ -1005,9 +1012,9 @@ function ErrorView({ msg, onRetry }) {
 }
 
 // ── Round icon button (shuffle / add) ──
-function RoundBtn({ onClick, label, children, accent = "#E0662A", active = false, disabled = false }) {
+function RoundBtn({ onClick, label, children, accent = "#E0662A", active = false }) {
   return (
-    <button onClick={onClick} disabled={disabled} aria-label={label} aria-pressed={active} title={label} style={{ position: "relative", width: 52, height: 52, borderRadius: "50%", border: active ? `2px solid ${accent}` : "none", background: active ? `${accent}1A` : STU.fill, color: active ? accent : STU.ink, display: "flex", alignItems: "center", justifyContent: "center", cursor: disabled ? "not-allowed" : "pointer", opacity: disabled ? 0.38 : 1, flexShrink: 0 }}>
+    <button onClick={onClick} aria-label={label} aria-pressed={active} title={label} style={{ position: "relative", width: 52, height: 52, borderRadius: "50%", border: active ? `2px solid ${accent}` : "none", background: active ? `${accent}1A` : STU.fill, color: active ? accent : STU.ink, display: "flex", alignItems: "center", justifyContent: "center", cursor: "pointer", flexShrink: 0 }}>
       {children}
       {active && <span style={{ position: "absolute", bottom: 7, width: 4, height: 4, borderRadius: "50%", background: accent }} />}
     </button>
@@ -1127,7 +1134,7 @@ function StationView({ result, shot, accent, accent2, onMood, busyMood, onRestar
   const saveWorking = spotify.status === "connecting" || spotify.status === "working";
 
   // 메인 CTA 라벨: 상태별로 명확히 구분
-  const playLabel = working ? "준비 중…" : err ? "다시 재생" : playing ? "일시정지" : "지금재생";
+  const playLabel = working ? "준비 중…" : err ? "다시 재생" : playing ? "일시정지" : ready ? "재생" : "지금 이 플레이리스트 재생하기";
 
   let n = 0;
   return (
@@ -1146,7 +1153,7 @@ function StationView({ result, shot, accent, accent2, onMood, busyMood, onRestar
           <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", paddingTop: "max(env(safe-area-inset-top), 28px)" }}>
             <button onClick={onRestart} aria-label="다른 장면" style={{ width: 38, height: 38, borderRadius: "50%", border: "none", background: "rgba(255,255,255,.55)", backdropFilter: "blur(8px)", color: STU.ink, display: "flex", alignItems: "center", justifyContent: "center", cursor: "pointer", boxShadow: "0 1px 4px rgba(0,0,0,.08)" }}><ChevronLeft /></button>
             <Wordmark />
-            <button onClick={onSaveSpotify} disabled={saveWorking} aria-label="공유/저장" title="Spotify에 저장" style={{ width: 38, height: 38, borderRadius: "50%", border: "none", background: "rgba(255,255,255,.55)", backdropFilter: "blur(8px)", color: STU.ink, display: "flex", alignItems: "center", justifyContent: "center", cursor: saveWorking ? "not-allowed" : "pointer", opacity: saveWorking ? 0.38 : 1, boxShadow: "0 1px 4px rgba(0,0,0,.08)" }}><ShareIcon /></button>
+            <button onClick={onSaveSpotify} aria-label="공유/저장" style={{ width: 38, height: 38, borderRadius: "50%", border: "none", background: "rgba(255,255,255,.55)", backdropFilter: "blur(8px)", color: STU.ink, display: "flex", alignItems: "center", justifyContent: "center", cursor: "pointer", boxShadow: "0 1px 4px rgba(0,0,0,.08)" }}><ShareIcon /></button>
           </div>
 
           {/* spacer revealing the artwork */}
@@ -1159,13 +1166,13 @@ function StationView({ result, shot, accent, accent2, onMood, busyMood, onRestar
             {meta && <div className="sfm-lat" style={{ marginTop: 10, fontSize: 12.5, fontWeight: 600, letterSpacing: ".06em", color: accent }}>{meta}</div>}
           </div>
 
-          {/* action row: 셔플 토글 · 앱 자체 재생 CTA · 저장 */}
+          {/* action row: 셔플 토글 · 재생 CTA · 저장 */}
           <div style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: 14, margin: "20px 0 10px" }}>
             <RoundBtn onClick={onShuffle} label="랜덤 재생" active={shuffle} accent={accent}><ShuffleIcon /></RoundBtn>
             <button onClick={ready ? onTogglePlay : onPlayInApp} style={{ flex: 1, maxWidth: 300, minHeight: 58, padding: "0 14px", display: "flex", alignItems: "center", justifyContent: "center", gap: 10, borderRadius: 999, border: "none", background: STU.ink, color: "#fff", cursor: "pointer", fontWeight: 800, fontSize: everPlayed ? 18 : 16, lineHeight: 1.15 }}>
               {working ? <><span className="sfm-spin" style={{ width: 18, height: 18, borderRadius: "50%", border: "2px solid rgba(255,255,255,.35)", borderTopColor: "#fff", animation: "sfm-spin 1s linear infinite" }} /> 준비 중…</> : <>{playing ? <PauseIcon /> : <PlayIcon big />} {playLabel}</>}
             </button>
-            <RoundBtn onClick={onSaveSpotify} label="Spotify에 저장" disabled={saveWorking}>{saveDone ? <CheckIcon /> : <PlusIcon />}</RoundBtn>
+            <RoundBtn onClick={onSaveSpotify} label="Spotify에 저장">{saveDone ? <CheckIcon /> : <PlusIcon />}</RoundBtn>
           </div>
 
           {/* 랜덤 재생 상태 표시 */}
@@ -1175,9 +1182,9 @@ function StationView({ result, shot, accent, accent2, onMood, busyMood, onRestar
             </div>
           )}
 
-          {/* 보조 트리거: 외부에서 열기 · 다시 만들기 */}
+          {/* 보조 트리거: Spotify에서 열기 · 다시 만들기 */}
           <div style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: 8, marginBottom: 4 }}>
-            <button onClick={onOpenSpotify} style={{ display: "inline-flex", alignItems: "center", gap: 6, padding: "8px 14px", borderRadius: 999, border: `1px solid ${STU.line}`, background: STU.bg, color: STU.ink, cursor: "pointer", fontWeight: 700, fontSize: 13 }}><SpotifyIcon size={15} color="#1DB954" /> Spotify 외부 열기</button>
+            <button onClick={onOpenSpotify} style={{ display: "inline-flex", alignItems: "center", gap: 6, padding: "8px 14px", borderRadius: 999, border: `1px solid ${STU.line}`, background: STU.bg, color: STU.ink, cursor: "pointer", fontWeight: 700, fontSize: 13 }}><SpotifyIcon size={15} color="#1DB954" /> Spotify에서 열기</button>
             <button onClick={onRestart} style={{ display: "inline-flex", alignItems: "center", gap: 6, padding: "8px 14px", borderRadius: 999, border: `1px solid ${STU.line}`, background: STU.bg, color: STU.ink, cursor: "pointer", fontWeight: 700, fontSize: 13 }}><RefreshIcon /> 다시 만들기</button>
           </div>
 
@@ -1265,3 +1272,4 @@ function MoreIcon() { return <svg width="20" height="20" viewBox="0 0 24 24" fil
 function ChevronLeft() { return <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round"><path d="M15 18l-6-6 6-6" /></svg>; }
 function ShareIcon() { return <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"><path d="M12 16V4M8 8l4-4 4 4" /><path d="M5 12v7a1 1 0 001 1h12a1 1 0 001-1v-7" /></svg>; }
 function SpotifyIcon({ size = 18, color = "#1DB954" }) { return <svg width={size} height={size} viewBox="0 0 24 24" fill={color}><path d="M12 2a10 10 0 100 20 10 10 0 000-20zm4.6 14.4a.62.62 0 01-.86.21c-2.35-1.44-5.3-1.76-8.79-.96a.62.62 0 11-.28-1.21c3.81-.87 7.08-.5 9.72 1.11.3.18.39.57.21.85zm1.23-2.73a.78.78 0 01-1.07.26c-2.69-1.65-6.79-2.13-9.97-1.17a.78.78 0 11-.45-1.49c3.63-1.1 8.15-.56 11.24 1.33.36.22.48.7.25 1.07zm.1-2.85C14.84 8.95 9.6 8.78 6.6 9.69a.93.93 0 11-.54-1.78c3.45-1.05 9.23-.85 12.87 1.31a.93.93 0 11-.95 1.6z" /></svg>; }
+
