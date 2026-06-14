@@ -407,18 +407,61 @@ function loadSpotifySdk() {
 function spotifyCacheKey(t, a) {
   return `scenefm:spotify-uri:${String(t || "").trim().toLowerCase()}::${String(a || "").trim().toLowerCase()}`;
 }
-async function searchTrackUri(token, t, a) {
-  const cacheKey = spotifyCacheKey(t, a);
+function trackSpotifyUri(track) {
+  const uri = track?.uri || track?.spotify_uri || track?.spotifyUri || track?.spotify?.uri;
+  if (typeof uri === "string" && uri.startsWith("spotify:track:")) return uri;
+  const id = track?.spotify_id || track?.spotifyId || track?.spotify?.id;
+  if (typeof id === "string" && /^[A-Za-z0-9]{22}$/.test(id)) return `spotify:track:${id}`;
+  const url = track?.spotify_url || track?.spotifyUrl || track?.spotify?.url;
+  const m = typeof url === "string" ? url.match(/open\.spotify\.com\/track\/([A-Za-z0-9]{22})/) : null;
+  return m ? `spotify:track:${m[1]}` : null;
+}
+function cachedTrackUri(track) {
+  const uri = trackSpotifyUri(track);
+  if (uri) return uri;
   try {
-    const cached = localStorage.getItem(cacheKey);
+    const cached = localStorage.getItem(spotifyCacheKey(track?.t, track?.a));
     if (cached) return cached === "__MISS__" ? null : cached;
   } catch {}
-  const params = new URLSearchParams({ type: "track", limit: "1", q: `${t} ${a}` });
-  const d = await spGet(token, "/search?" + params.toString());
-  const item = d.tracks && d.tracks.items && d.tracks.items[0];
-  const uri = item && typeof item.uri === "string" && item.uri.startsWith("spotify:track:") ? item.uri : null;
-  try { localStorage.setItem(cacheKey, uri || "__MISS__"); } catch {}
-  return uri;
+  return null;
+}
+async function resolveTracksOnServer(tracks, limit = Infinity) {
+  const target = Number.isFinite(limit) ? limit : tracks.length;
+  const selected = tracks.slice(0, Number.isFinite(limit) ? Math.min(tracks.length, Math.max(target, 6)) : tracks.length);
+  const localUris = [];
+  const unresolved = [];
+  for (const track of selected) {
+    const uri = cachedTrackUri(track);
+    if (uri) localUris.push(uri);
+    else unresolved.push(track);
+  }
+  if (!unresolved.length) return localUris;
+  const res = await fetch("/api/resolve-tracks", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ tracks: unresolved.map((track) => ({ t: track.t, a: track.a, y: track.y })), limit: target }),
+  });
+  if (!res.ok) {
+    let detail = "";
+    try {
+      const body = await res.json();
+      detail = body?.error?.message || body?.error || "";
+    } catch {}
+    throw new Error(detail || "곡 매칭 서버에 연결하지 못했어요.");
+  }
+  const data = await res.json();
+  const resolved = Array.isArray(data.results)
+    ? data.results.map((item) => item?.uri || null)
+    : (Array.isArray(data.uris) ? data.uris : []);
+  const out = localUris.slice();
+  for (let i = 0; i < unresolved.length; i++) {
+    const uri = resolved[i];
+    if (typeof uri === "string" && uri.startsWith("spotify:track:")) {
+      out.push(uri);
+      try { localStorage.setItem(spotifyCacheKey(unresolved[i].t, unresolved[i].a), uri); } catch {}
+    }
+  }
+  return out;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -557,16 +600,14 @@ export default function SceneFM() {
     return tokenRef.current;
   }, []);
 
-  const resolveQueueUris = useCallback(async (access, tracks, onProgress, maxMatches = Infinity) => {
-    const seen = new Set(); const uris = []; let done = 0;
-    for (const t of tracks) {
-      if (done > 0) await sleep(180);
-      const uri = await searchTrackUri(access, t.t, t.a);
+  const resolveQueueUris = useCallback(async (tracks, onProgress, maxMatches = Infinity) => {
+    const rawUris = await resolveTracksOnServer(tracks, maxMatches);
+    const seen = new Set(); const uris = [];
+    for (const uri of rawUris) {
       if (uri && !seen.has(uri)) { seen.add(uri); uris.push(uri); }
-      done++;
-      onProgress && onProgress(done, uris.length);
       if (uris.length >= maxMatches) break;
     }
+    onProgress && onProgress(Math.min(tracks.length, Number.isFinite(maxMatches) ? maxMatches : tracks.length), uris.length);
     return uris;
   }, []);
 
@@ -576,11 +617,10 @@ export default function SceneFM() {
     if (preparedRef.current.tracks === tracks && preparedRef.current.uris.length) {
       return preparedRef.current.uris.slice(0, maxMatches);
     }
-    const { access } = await ensureSpotify();
-    const uris = await resolveQueueUris(access, tracks, null, maxMatches);
+    const uris = await resolveQueueUris(tracks, null, maxMatches);
     preparedRef.current = { tracks, uris };
     return uris;
-  }, [ensureSpotify, resolveQueueUris]);
+  }, [resolveQueueUris]);
 
   // 429 방지: 결과 표시 직후 자동 곡 검색은 하지 않는다.
   // 재생 버튼을 눌렀을 때 필요한 첫 곡만 찾는다.
@@ -592,7 +632,7 @@ export default function SceneFM() {
       setSpotify({ status: "connecting", progress: "Spotify 연결 중…", url: "", matched: 0, total: tracks.length, error: "" });
       const { access, userId } = await ensureSpotify();
       setSpotify((s) => ({ ...s, status: "working", progress: "곡을 찾는 중…" }));
-      const uris = await resolveQueueUris(access, tracks, (done, matched) =>
+      const uris = await resolveQueueUris(tracks, (done, matched) =>
         setSpotify((s) => ({ ...s, progress: `곡을 찾는 중 ${done}/${Math.min(8, tracks.length)}`, matched })), 8);
       if (!uris.length) throw new Error("이 장면의 곡들이 Spotify에 없어 플레이리스트를 만들지 못했어요.");
       setSpotify((s) => ({ ...s, progress: `${uris.length}곡으로 플레이리스트 만드는 중…` }));
