@@ -404,14 +404,21 @@ function loadSpotifySdk() {
   });
   return sdkPromise;
 }
+function spotifyCacheKey(t, a) {
+  return `scenefm:spotify-uri:${String(t || "").trim().toLowerCase()}::${String(a || "").trim().toLowerCase()}`;
+}
 async function searchTrackUri(token, t, a) {
-  const tryQ = async (q) => {
-    const params = new URLSearchParams({ type: "track", limit: "5", q });
-    const d = await spGet(token, "/search?" + params.toString());
-    const item = d.tracks && d.tracks.items && d.tracks.items[0];
-    return item && typeof item.uri === "string" && item.uri.startsWith("spotify:track:") ? item.uri : null;
-  };
-  return (await tryQ(`track:${t} artist:${a}`)) || (await tryQ(`${t} ${a}`));
+  const cacheKey = spotifyCacheKey(t, a);
+  try {
+    const cached = localStorage.getItem(cacheKey);
+    if (cached) return cached === "__MISS__" ? null : cached;
+  } catch {}
+  const params = new URLSearchParams({ type: "track", limit: "1", q: `${t} ${a}` });
+  const d = await spGet(token, "/search?" + params.toString());
+  const item = d.tracks && d.tracks.items && d.tracks.items[0];
+  const uri = item && typeof item.uri === "string" && item.uri.startsWith("spotify:track:") ? item.uri : null;
+  try { localStorage.setItem(cacheKey, uri || "__MISS__"); } catch {}
+  return uri;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -575,20 +582,8 @@ export default function SceneFM() {
     return uris;
   }, [ensureSpotify, resolveQueueUris]);
 
-  // 결과가 뜨고 이미 로그인돼 있으면, 탭하기 전에 미리 URI를 찾아 캐시한다.
-  // → 재생 탭 시 검색 지연이 사라져 자동재생 정책에 걸리지 않는다.
-  useEffect(() => {
-    const tracks = result && result.tracks;
-    if (!tracks || !tracks.length || !tokenRef.current.access) return;
-    let cancelled = false;
-    (async () => {
-      try {
-        const uris = await resolveQueueUris(tokenRef.current.access, tracks, null, 8);
-        if (!cancelled && uris.length) preparedRef.current = { tracks, uris };
-      } catch {}
-    })();
-    return () => { cancelled = true; };
-  }, [result, resolveQueueUris]);
+  // 429 방지: 결과 표시 직후 자동 곡 검색은 하지 않는다.
+  // 재생 버튼을 눌렀을 때 필요한 첫 곡만 찾는다.
 
   const saveToSpotify = useCallback(async () => {
     const tracks = (result && result.tracks) || [];
@@ -598,7 +593,7 @@ export default function SceneFM() {
       const { access, userId } = await ensureSpotify();
       setSpotify((s) => ({ ...s, status: "working", progress: "곡을 찾는 중…" }));
       const uris = await resolveQueueUris(access, tracks, (done, matched) =>
-        setSpotify((s) => ({ ...s, progress: `곡을 찾는 중 ${done}/${tracks.length}`, matched })));
+        setSpotify((s) => ({ ...s, progress: `곡을 찾는 중 ${done}/${Math.min(8, tracks.length)}`, matched })), 8);
       if (!uris.length) throw new Error("이 장면의 곡들이 Spotify에 없어 플레이리스트를 만들지 못했어요.");
       setSpotify((s) => ({ ...s, progress: `${uris.length}곡으로 플레이리스트 만드는 중…` }));
       const desc = (result.tagline ? result.tagline + " · " : "") + "Made by Scene FM";
@@ -702,13 +697,9 @@ export default function SceneFM() {
       try { sdkPlayer.activateElement && sdkPlayer.activateElement(); } catch {}
 
       setPlayer((p) => ({ ...p, status: "resolving" }));
-      let uris = await getUris(tracks, 8);         // 미리 찾아둔 캐시면 즉시
+      const playbackTracks = startTrack ? [startTrack, ...tracks.filter((t) => t !== startTrack)] : (doShuffle ? shuffleArr(tracks) : tracks);
+      let uris = await getUris(playbackTracks, 1); // 429 방지: 우선 1곡만 찾아 바로 재생
       if (!uris.length) throw new Error("이 장면의 곡들이 Spotify에 없어 재생할 수 없어요.");
-      if (doShuffle) uris = shuffleArr(uris);
-      if (startTrack) {
-        const u = await searchTrackUri(tokenRef.current.access, startTrack.t, startTrack.a);
-        if (u) uris = [u, ...uris.filter((x) => x !== u)];
-      }
       urisRef.current = uris;
       setPlayer((p) => ({ ...p, status: "ready", uris, index: 0 }));
       await transferPlayback(tokenRef.current.access, deviceIdRef.current);
