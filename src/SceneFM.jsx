@@ -174,10 +174,20 @@ function sampleVideoFile(file, maxDim = 1024, quality = 0.82) {
   });
 }
 function extractJson(text) {
+  if (!text || !String(text).trim()) {
+    throw new Error("분석 서버가 빈 응답을 보냈어요. 잠시 뒤 다시 시도해 주세요.");
+  }
   let t = text.replace(/```json/gi, "").replace(/```/g, "").trim();
   const a = t.indexOf("{"), b = t.lastIndexOf("}");
-  if (a !== -1 && b !== -1) t = t.slice(a, b + 1);
-  return JSON.parse(t);
+  if (a === -1 || b === -1 || b <= a) {
+    throw new Error("분석 결과에서 JSON을 찾지 못했어요. 다시 촬영해 주세요.");
+  }
+  t = t.slice(a, b + 1);
+  try {
+    return JSON.parse(t);
+  } catch {
+    throw new Error("분석 결과 JSON이 완성되지 않았어요. 다시 촬영해 주세요.");
+  }
 }
 
 // ── Anthropic vision call (claude.ai 아티팩트 프록시 사용; 배포 시 백엔드 프록시 필요 — SETUP.md) ──
@@ -224,22 +234,28 @@ async function callSceneFM(frames, modifier, context) {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
-      model: "claude-sonnet-4-6", max_tokens: 1000, system,
+      model: "claude-sonnet-4-6", max_tokens: 2200, system,
       messages: [{ role: "user", content: [
         ...imageBlocks,
         { type: "text", text: userText },
       ] }],
     }),
   });
-  if (!res.ok) {
-    let detail = "";
+  const responseText = await res.text();
+  let data = null;
+  if (responseText) {
     try {
-      const errBody = await res.json();
-      detail = errBody?.error?.message || errBody?.error || JSON.stringify(errBody);
-    } catch {}
+      data = JSON.parse(responseText);
+    } catch {
+      const preview = responseText.slice(0, 120).replace(/\s+/g, " ");
+      throw new Error(`분석 서버가 JSON이 아닌 응답을 보냈어요.${preview ? ` (${preview})` : ""}`);
+    }
+  }
+  if (!res.ok) {
+    const detail = data?.error?.message || data?.error || responseText || "";
     throw new Error(`분석 서버에 연결하지 못했어요.${detail ? ` (${detail})` : ""}`);
   }
-  const data = await res.json();
+  if (!data) throw new Error("분석 서버가 빈 응답을 보냈어요. 잠시 뒤 다시 시도해 주세요.");
   const text = (data.content || []).filter((b) => b.type === "text").map((b) => b.text).join("");
   return extractJson(text);
 }
