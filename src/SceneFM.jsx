@@ -444,14 +444,18 @@ async function resolveTracksOnServer(tracks, limit = Infinity, accessToken = "")
     },
     body: JSON.stringify({ tracks: unresolved.map((track) => ({ t: track.t, a: track.a, y: track.y })), limit: target }),
   });
-  if (!res.ok) {
-    let detail = "";
+  const responseText = await res.text();
+  let responseBody = null;
+  if (responseText) {
     try {
-      const body = await res.json();
-      detail = body?.error?.message || body?.error || "";
+      responseBody = JSON.parse(responseText);
     } catch {
-      try { detail = await res.text(); } catch {}
+      const preview = responseText.slice(0, 120).replace(/\s+/g, " ");
+      throw new Error(`/api/resolve-tracks가 JSON이 아닌 응답을 보냈어요.${preview ? ` (${preview})` : ""}`);
     }
+  }
+  if (!res.ok) {
+    const detail = responseBody?.error?.message || responseBody?.error || responseText || "";
     const prefix = `/api/resolve-tracks ${res.status}`;
     const hint =
       res.status === 404 ? "배포에 api/resolve-tracks.js가 포함되지 않았어요."
@@ -460,7 +464,10 @@ async function resolveTracksOnServer(tracks, limit = Infinity, accessToken = "")
       : "곡 매칭 서버 요청에 실패했어요.";
     throw new Error(`${prefix}: ${detail || hint}`);
   }
-  const data = await res.json();
+  if (!responseBody) {
+    throw new Error("/api/resolve-tracks가 빈 응답을 보냈어요.");
+  }
+  const data = responseBody;
   const resolved = Array.isArray(data.results)
     ? data.results.map((item) => item?.uri || null)
     : (Array.isArray(data.uris) ? data.uris : []);
